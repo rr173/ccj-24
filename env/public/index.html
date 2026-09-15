@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>音频时间尺</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header id="toolbar">
+  <button id="btnImport">导入音频</button>
+  <input id="fileInput" type="file" accept="audio/*" multiple hidden>
+  <button id="btnDemo">+ 测试音</button>
+  <span class="sep"></span>
+  <button id="btnPlay" title="空格">▶</button>
+  <button id="btnPause">⏸</button>
+  <button id="btnStop">⏹</button>
+  <span id="time">00:00.000</span>
+  <span class="sep"></span>
+  <button id="btnLoop">循环:关</button>
+  <button id="btnClearLoop">清除循环</button>
+  <span id="loopInfo"></span>
+  <span class="sep"></span>
+  <label class="zoom">缩放 <input id="zoom" type="range" min="20" max="400" value="100"></label>
+</header>
+
+<div id="main">
+  <div id="scroll">
+    <div id="timeline">
+      <canvas id="ruler"></canvas>
+      <div id="loopregion"></div>
+      <div id="lanes"></div>
+      <div id="playhead"></div>
+    </div>
+  </div>
+
+  <aside id="panel">
+    <h2>片段</h2>
+    <div id="panelEmpty">未选中片段</div>
+    <div id="panelBody" hidden>
+      <div id="pName"></div>
+      <label>位置 (s) <input id="pPos" type="number" step="0.001" min="0"></label>
+      <label>增益 <input id="pGain" type="range" min="0" max="2" step="0.01"> <span id="pGainVal">1.00</span></label>
+      <label>淡入 (s) <input id="pFadeIn" type="number" step="0.01" min="0"></label>
+      <label>淡出 (s) <input id="pFadeOut" type="number" step="0.01" min="0"></label>
+      <button id="pDelete">删除片段</button>
+    </div>
+    <div class="hint">
+      <b>操作</b><br>
+      · 拖动片段本体 = 移动（淡化区间跟着走）<br>
+      · 拖动片段两端 ◆ 柄 = 调淡入/淡出<br>
+      · 标尺单击 = 定位播放头<br>
+      · 标尺上拖出区间 = 设置循环（吸附到采样）<br>
+      · 空格 = 播放 / 暂停<br>
+      · 播放中可拖动尚未播到的片段，指针不会跳
+    </div>
+  </aside>
+</div>
+
+<script src="app.js"></script>
+</body>
+</html>
