@@ -86,6 +86,15 @@ global.window = global;
 global.self = global;
 global.alert = msg => { throw new Error('不应弹出 alert: ' + msg); };
 global.requestAnimationFrame = () => 1;
+global.prompt = () => null;
+/* localStorage 桩（store 的意图清单） */
+const ls = new Map();
+global.localStorage = {
+  getItem: k => (ls.has(k) ? ls.get(k) : null),
+  setItem: (k, v) => ls.set(k, String(v)),
+  removeItem: k => ls.delete(k),
+};
+/* IDB 工厂在 Node 下不可用，createDefaultKV 会降级到内存异步 KV */
 let blobSeq = 0;
 const blobStore = new Map();
 global.URL = {
@@ -111,9 +120,13 @@ class FakeAudioContext {
 }
 global.AudioContext = FakeAudioContext;
 
-/* ---------- 加载被测代码 ---------- */
+/* ---------- 加载被测代码（UMD：历史/WAL/KV/存储/应用） ---------- */
 
 Object.assign(global, require('../public/export-core.js'));
+Object.assign(global, require('../public/history-core.js'));
+Object.assign(global, require('../public/wal-core.js'));
+Object.assign(global, require('../public/idb-kv.js'));
+Object.assign(global, require('../public/store.js'));
 require('../public/app.js');
 
 /* ---------- 测试辅助 ---------- */
@@ -171,6 +184,9 @@ function setGain(v) {
 }
 
 (async () => {
+
+  /* 显式引导存储层（浏览器里由 app.js 的 boot() 完成；Node 桩下用内存 KV） */
+  await (typeof bootAppForTest === 'function' ? bootAppForTest() : null);
 
   /* 初始：空列表提示可见 */
   await test('初始任务列表为空', () => {

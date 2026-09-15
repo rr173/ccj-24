@@ -4,6 +4,6 @@
   "private": true,
   "scripts": {
     "start": "node server.js",
-    "test": "node test/export-core.test.js && node test/app-export.test.js"
+    "test": "node test/export-core.test.js && node test/app-export.test.js && node test/history-core.test.js && node test/wal-store.test.js && node test/app-history.test.js"
   }
 }

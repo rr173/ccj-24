@@ -10,7 +10,11 @@
 <header id="toolbar">
   <button id="btnImport">导入音频</button>
   <input id="fileInput" type="file" accept="audio/*" multiple hidden>
+  <input id="relinkInput" type="file" accept="audio/*" hidden>
   <button id="btnDemo">+ 测试音</button>
+  <span class="sep"></span>
+  <button id="btnUndo" title="Ctrl/⌘+Z">↶ 撤销</button>
+  <button id="btnRedo" title="Ctrl/⌘+Shift+Z">↷ 重做</button>
   <span class="sep"></span>
   <button id="btnPlay" title="空格">▶</button>
   <button id="btnPause">⏸</button>
@@ -24,6 +28,17 @@
   <label class="zoom">缩放 <input id="zoom" type="range" min="20" max="400" value="100"></label>
 </header>
 
+<div id="statusbar">
+  <span id="stBranch" title="当前分支">🌿 <b>主分支</b></span>
+  <span id="stPos"></span>
+  <span class="sep"></span>
+  <span id="stSave" class="save">已保存</span>
+  <span id="stUndo" title="当前分支可撤销/重做范围"></span>
+  <span id="stPreview" class="preview-tag" hidden>预览中（不改动工程）</span>
+  <span id="stMsg" class="warn"></span>
+  <span id="stDegraded" class="warn" hidden>⚠ 持久化不可用：本次编辑刷新后不会保留</span>
+</div>
+
 <div id="main">
   <div id="scroll">
     <div id="timeline">
@@ -35,8 +50,8 @@
   </div>
 
   <aside id="panel">
-    <h2>片段</h2>
-    <div id="panelEmpty">未选中片段</div>
+    <h2>片段 <span id="selCount" class="muted"></span></h2>
+    <div id="panelEmpty">未选中片段（点选，Shift/Ctrl 可多选）</div>
     <div id="panelBody" hidden>
       <div id="pName"></div>
       <label>位置 (s) <input id="pPos" type="number" step="0.001" min="0"></label>
@@ -44,16 +59,47 @@
       <label>淡入 (s) <input id="pFadeIn" type="number" step="0.01" min="0"></label>
       <label>淡出 (s) <input id="pFadeOut" type="number" step="0.01" min="0"></label>
       <button id="pDelete">删除片段</button>
+      <div id="multiBox" hidden>
+        <hr>
+        <div class="muted">已选 <b id="multiN"></b> 个片段（批量修改只算一次撤销）</div>
+        <label>批量增益 <input id="mGain" type="range" min="0" max="2" step="0.01"></label>
+        <button id="mDelete">批量删除</button>
+      </div>
+      <div id="missingBox" hidden>
+        <hr>
+        <div class="warn">⚠ 素材缺失或已损坏：波形/声音不可用，历史与位置仍完整保留。</div>
+        <button id="btnRelink">重新关联音频文件…</button>
+      </div>
     </div>
     <div class="hint">
       <b>操作</b><br>
-      · 拖动片段本体 = 移动（淡化区间跟着走）<br>
-      · 拖动片段两端 ◆ 柄 = 调淡入/淡出<br>
-      · 标尺单击 = 定位播放头<br>
-      · 标尺上拖出区间 = 设置循环（吸附到采样），同时填入导出区间<br>
-      · 空格 = 播放 / 暂停<br>
-      · 播放中可拖动尚未播到的片段，指针不会跳<br>
-      · 导出在后台进行：提交后仍可继续编辑与预听，不影响任务结果
+      · 拖动片段本体 = 移动（整次拖动 = 一次撤销）<br>
+      · 拖动片段两端 ◆ 柄 = 调淡入/淡出（整次拖动 = 一次撤销）<br>
+      · 点选 / Shift、Ctrl+点击 = 单选 / 多选批量改<br>
+      · 标尺单击 = 定位播放头；标尺拖动 = 循环区间（吸附采样）<br>
+      · 空格 = 播放 / 暂停；Ctrl+Z / Ctrl+Shift+Z = 撤销 / 重做
+    </div>
+
+    <h2 class="sec">检查点</h2>
+    <div class="btnrow">
+      <input id="cpName" type="text" placeholder="检查点名称（可空）">
+      <button id="btnCp">＋ 建检查点</button>
+    </div>
+    <div id="checkpoints"></div>
+
+    <h2 class="sec">分支与历史</h2>
+    <div class="btnrow">
+      <select id="branchSel"></select>
+      <button id="btnNewBranch" title="从当前位置新建命名分支">新建分支</button>
+    </div>
+    <div id="historyList"></div>
+    <div id="previewBar" hidden>
+      <div id="previewTitle"></div>
+      <div id="previewDiff"></div>
+      <div class="btnrow">
+        <button id="pvExit">退出预览</button>
+        <button id="pvFork">恢复为新分支</button>
+      </div>
     </div>
 
     <h2 class="sec">导出 WAV</h2>
@@ -93,7 +139,13 @@
   </aside>
 </div>
 
+<div id="toast" hidden></div>
+
 <script src="export-core.js"></script>
+<script src="history-core.js"></script>
+<script src="wal-core.js"></script>
+<script src="idb-kv.js"></script>
+<script src="store.js"></script>
 <script src="app.js"></script>
 </body>
 </html>
