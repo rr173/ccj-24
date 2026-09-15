@@ -77,3 +77,57 @@ button.active { background: #2f5da8; border-color: #4f8ef7; }
 #pName { font-weight: 600; margin-bottom: 6px; word-break: break-all; }
 #pDelete { margin-top: 10px; color: #ff8f8f; }
 .hint { margin-top: 18px; color: #6b7280; font-size: 12px; line-height: 1.8; }
+
+/* ================= 导出 ================= */
+
+.sec { font-size: 14px; margin: 20px 0 10px; }
+#exportBox label { display: block; margin: 8px 0; color: #9aa3b2; }
+#exportBox input[type="number"] {
+  width: 90px; background: #14161c; color: #d6dae3;
+  border: 1px solid #3a4050; border-radius: 4px; padding: 3px 6px;
+}
+#exportBox select {
+  background: #14161c; color: #d6dae3;
+  border: 1px solid #3a4050; border-radius: 4px; padding: 3px 6px;
+}
+.btnrow { display: flex; gap: 6px; margin: 6px 0; }
+.btnrow button { font-size: 12px; padding: 3px 8px; }
+button.primary { background: #2f5da8; border-color: #4f8ef7; width: 100%; margin-top: 8px; }
+button.primary:hover { background: #3a6cbf; }
+#xInfo { margin-top: 8px; font-size: 12px; color: #9aa3b2; min-height: 16px; }
+#xInfo.over { color: #ffb45f; }
+
+#tasksEmpty { color: #6b7280; font-size: 12px; }
+.task {
+  border: 1px solid #2a2e38; border-radius: 6px; padding: 8px;
+  margin-bottom: 8px; background: #171a21;
+}
+.t-head { display: flex; justify-content: space-between; gap: 6px; font-size: 12px; }
+.t-title { color: #d6dae3; word-break: break-all; }
+.t-state {
+  flex: none; align-self: flex-start; padding: 0 6px; border-radius: 3px;
+  font-size: 11px; height: 16px; line-height: 16px; white-space: nowrap;
+}
+.st-pending .t-state { background: #3a4050; color: #c8cfdb; }
+.st-running .t-state { background: #2f5da8; color: #fff; }
+.st-canceled .t-state { background: #4a4a4a; color: #bbb; }
+.st-failed .t-state { background: #8a2f2f; color: #ffd7d7; }
+.st-done .t-state { background: #2f7a4f; color: #d8ffe6; }
+.t-bar { height: 6px; background: #10131a; border-radius: 3px; margin: 6px 0; overflow: hidden; }
+.t-fill { height: 100%; width: 0; background: #4f8ef7; transition: width .12s linear; }
+.st-done .t-fill { background: #4fc77f; }
+.st-canceled .t-fill, .st-failed .t-fill { background: #6b7280; }
+.t-meta { font-size: 11px; color: #9aa3b2; }
+.t-err { font-size: 11px; color: #ff9f9f; margin-top: 4px; word-break: break-all; }
+.t-actions { margin-top: 6px; display: flex; gap: 6px; }
+.t-actions button, .t-actions a.dl { font-size: 12px; padding: 3px 10px; }
+.t-actions a.dl {
+  background: #2f7a4f; border: 1px solid #4fc77f; border-radius: 4px;
+  color: #eafff2; text-decoration: none; display: inline-block; cursor: pointer;
+}
+.t-actions a.dl:hover { background: #37925e; }
+.task.flash { animation: taskflash 1.2s; }
+@keyframes taskflash {
+  0%, 100% { box-shadow: none; }
+  30% { box-shadow: 0 0 0 2px #4f8ef7; }
+}

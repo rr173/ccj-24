@@ -84,20 +84,17 @@ function buildClipDom(clip) {
   el.className = 'clip';
   el.style.background = clip.color + '55';
   el.style.borderColor = clip.color;
-  el.innerHTML =
-    '<canvas class="wave"></canvas>' +
-    '<div class="fade fade-in"></div><div class="fade fade-out"></div>' +
-    '<div class="handle hi"></div><div class="handle ho"></div>' +
-    '<span class="label"></span>';
-  el.querySelector('.label').textContent = clip.name;
+  const wave = document.createElement('canvas'); wave.className = 'wave';
+  const fi = document.createElement('div'); fi.className = 'fade fade-in';
+  const fo = document.createElement('div'); fo.className = 'fade fade-out';
+  const hi = document.createElement('div'); hi.className = 'handle hi';
+  const ho = document.createElement('div'); ho.className = 'handle ho';
+  const label = document.createElement('span'); label.className = 'label';
+  label.textContent = clip.name;
+  el.appendChild(wave); el.appendChild(fi); el.appendChild(fo);
+  el.appendChild(hi); el.appendChild(ho); el.appendChild(label);
   clip.el = el;
-  clip.els = {
-    wave: el.querySelector('.wave'),
-    fi: el.querySelector('.fade-in'),
-    fo: el.querySelector('.fade-out'),
-    hi: el.querySelector('.hi'),
-    ho: el.querySelector('.ho'),
-  };
+  clip.els = { wave, fi, fo, hi, ho };
   $('#lanes').appendChild(el);
 
   // 拖动片段本体：只改 clip.offset，淡化是片段属性（秒），天然跟着走
@@ -300,6 +297,7 @@ $('#ruler').addEventListener('pointerdown', e => {
       state.loop = { a, b };
       state.loopOn = true;
       updateLoopUI(); renderRuler();
+      fillExportRange(a, b); // 框选区间同时作为导出区间
     }
   };
   ruler.addEventListener('pointermove', move);
@@ -616,6 +614,264 @@ document.addEventListener('keydown', e => {
     state.playing ? pause() : play();
   }
 });
+
+/* ================= WAV 导出（任务化） ================= */
+
+const MAX_EXPORT_BYTES = 512 * 1024 * 1024; // 单次导出文件大小上限（超出即明确失败）
+const TASK_STATE_TEXT = { pending: '等待', running: '进行中', canceled: '已取消', failed: '失败', done: '已完成' };
+
+let taskSeq = 1;
+const exportTasks = [];   // 本次会话的全部导出任务（新任务显示在最前）
+let runningTask = null;
+
+/* 冻结提交时刻的片段内容与参数：之后对时间线的任何编辑都不影响该任务。
+   AudioBuffer 解码后内容不再被改写，引用即冻结；参数全部按值复制。
+   只收与区间相交的片段（区间外的片段不影响导出结果）。 */
+function takeSnapshot(a, b) {
+  const clips = [];
+  for (const c of state.clips) {
+    if (c.offset >= b || c.offset + c.duration <= a) continue;
+    clips.push({
+      name: c.name, buffer: c.buffer,
+      offset: c.offset, gain: c.gain,
+      fadeIn: c.fadeIn, fadeOut: c.fadeOut, duration: c.duration,
+    });
+  }
+  clips.sort((x, y) => x.offset - y.offset || bufferUid(x.buffer) - bufferUid(y.buffer));
+  return { a, b, clips };
+}
+
+function specText(spec) {
+  const bits = { '16': '16bit', '24': '24bit', '32f': '32f' }[spec.bitDepth];
+  return `${spec.sampleRate}Hz · ${spec.channels === 1 ? '单声道' : '立体声'} · ${bits}`;
+}
+
+function readExportSpec() {
+  return {
+    sampleRate: parseInt($('#xRate').value, 10),
+    channels: parseInt($('#xCh').value, 10),
+    bitDepth: $('#xBits').value,
+  };
+}
+
+function fillExportRange(a, b) {
+  $('#xStart').value = a.toFixed(3);
+  $('#xEnd').value = b.toFixed(3);
+  updateExportInfo();
+}
+
+function updateExportInfo() {
+  const a = parseFloat($('#xStart').value), b = parseFloat($('#xEnd').value);
+  const el = $('#xInfo');
+  el.classList.remove('over');
+  if (!isFinite(a) || !isFinite(b) || a < 0 || b <= a) { el.textContent = ''; return; }
+  const spec = readExportSpec();
+  const frames = Math.round((b - a) * spec.sampleRate);
+  const bytes = 44 + frames * bytesPerFrame(spec);
+  el.textContent = `预计 ${frames.toLocaleString()} 采样 · 约 ${fmtBytes(bytes)}`;
+  if (bytes > MAX_EXPORT_BYTES) {
+    el.textContent += `（超过上限 ${fmtBytes(MAX_EXPORT_BYTES)}）`;
+    el.classList.add('over');
+  }
+}
+
+/* 提交导出：相同区间 + 相同快照 + 相同规格 ⇒ 复用已有任务，不产生第二个 */
+function enqueueExport(snap, spec) {
+  const fp = snapshotFingerprint(snap, spec);
+  const dup = exportTasks.find(t => t.fingerprint === fp &&
+    (t.state === 'pending' || t.state === 'running' || t.state === 'done'));
+  if (dup) { flashTask(dup); return dup; }
+  const task = {
+    id: taskSeq++, fingerprint: fp, snap, spec,
+    state: 'pending', progress: 0, error: '',
+    blobUrl: '', blobSize: 0, cancelRequested: false,
+    frames: Math.round((snap.b - snap.a) * spec.sampleRate),
+    els: null,
+  };
+  exportTasks.unshift(task);
+  buildTaskDom(task);
+  // 提交即校验：预计文件超过限制 ⇒ 明确失败（任务留在列表里可查看原因）
+  const estBytes = 44 + task.frames * bytesPerFrame(spec);
+  if (!(task.frames > 0)) failTask(task, '导出区间无效');
+  else if (estBytes > MAX_EXPORT_BYTES) {
+    failTask(task, `预计文件约 ${fmtBytes(estBytes)}，超过单次导出上限 ${fmtBytes(MAX_EXPORT_BYTES)}`);
+  }
+  updateTaskUI(task);
+  pumpQueue();
+  return task;
+}
+
+function failTask(task, msg) {
+  task.state = 'failed';
+  task.error = msg;
+}
+
+function pumpQueue() {
+  if (runningTask) return;
+  const next = exportTasks.find(t => t.state === 'pending');
+  if (!next) return;
+  runningTask = next;
+  runExport(next).then(
+    () => { runningTask = null; pumpQueue(); },
+    () => { runningTask = null; pumpQueue(); },
+  );
+}
+
+async function runExport(task) {
+  task.state = 'running';
+  updateTaskUI(task);
+  try {
+    const res = await renderWav(task.snap, task.spec, {
+      shouldCancel: () => task.cancelRequested,
+      onProgress: p => { // 进度只向前
+        task.progress = Math.max(task.progress, p);
+        updateTaskProgress(task);
+      },
+      yieldControl: () => new Promise(r => setTimeout(r, 0)), // 块间让出：导出期间可继续编辑/预听
+    });
+    if (res.canceled) { task.state = 'canceled'; return; } // 不留半成品
+    const blob = new Blob(res.parts, { type: 'audio/wav' });
+    task.blobUrl = URL.createObjectURL(blob);
+    task.blobSize = blob.size;
+    task.progress = 1;
+    task.state = 'done';
+  } catch (err) {
+    task.state = 'failed';
+    task.error = friendlyError(err);
+  } finally {
+    updateTaskUI(task);
+  }
+}
+
+function cancelTask(task) {
+  if (task.state === 'pending') {
+    task.cancelRequested = true;
+    task.state = 'canceled';
+    updateTaskUI(task);
+  } else if (task.state === 'running') {
+    task.cancelRequested = true; // 渲染循环在块边界响应
+  }
+}
+
+function retryTask(task) {
+  if (task.state !== 'failed' && task.state !== 'canceled') return;
+  enqueueExport(task.snap, task.spec); // 从同一快照重新发起；去重逻辑照常生效
+}
+
+/* ---------- 任务列表 UI ---------- */
+
+function mkDiv(cls) {
+  const d = document.createElement('div');
+  d.className = cls;
+  return d;
+}
+
+function buildTaskDom(task) {
+  const el = mkDiv('task');
+  const head = mkDiv('t-head');
+  const title = document.createElement('span'); title.className = 't-title';
+  const state = document.createElement('span'); state.className = 't-state';
+  head.appendChild(title); head.appendChild(state);
+  const bar = mkDiv('t-bar');
+  const fill = mkDiv('t-fill');
+  bar.appendChild(fill);
+  const meta = mkDiv('t-meta');
+  const err = mkDiv('t-err'); err.hidden = true;
+  const actions = mkDiv('t-actions');
+  el.appendChild(head); el.appendChild(bar); el.appendChild(meta);
+  el.appendChild(err); el.appendChild(actions);
+  task.els = { root: el, title, state, fill, meta, err, actions };
+  task.els.title.textContent =
+    `#${task.id}  ${fmt(task.snap.a)} → ${fmt(task.snap.b)} · ${specText(task.spec)}`;
+  $('#tasksEmpty').hidden = true;
+  $('#tasks').prepend(el);
+  updateTaskUI(task);
+}
+
+function mkTaskBtn(text, onclick) {
+  const b = document.createElement('button');
+  b.textContent = text;
+  b.addEventListener('click', onclick);
+  return b;
+}
+
+function updateTaskUI(task) {
+  const e = task.els;
+  if (!e) return;
+  const flashing = e.root.classList.contains('flash');
+  e.root.className = 'task st-' + task.state + (flashing ? ' flash' : '');
+  e.state.textContent = TASK_STATE_TEXT[task.state];
+  updateTaskProgress(task);
+  e.err.hidden = task.state !== 'failed';
+  e.err.textContent = task.error || '';
+  e.actions.innerHTML = '';
+  if (task.state === 'pending' || task.state === 'running') {
+    e.actions.appendChild(mkTaskBtn('取消', () => cancelTask(task)));
+  } else if (task.state === 'failed') {
+    e.actions.appendChild(mkTaskBtn('重试', () => retryTask(task)));
+  } else if (task.state === 'canceled') {
+    e.actions.appendChild(mkTaskBtn('重新导出', () => retryTask(task)));
+  } else if (task.state === 'done') {
+    // 只有完成的任务可以下载
+    const a = document.createElement('a');
+    a.className = 'dl';
+    a.textContent = '下载 WAV';
+    a.href = task.blobUrl;
+    a.download = downloadName(task);
+    e.actions.appendChild(a);
+  }
+}
+
+function updateTaskProgress(task) {
+  const e = task.els;
+  if (!e) return;
+  e.fill.style.width = (task.progress * 100) + '%';
+  let meta = `${task.frames.toLocaleString()} 采样`;
+  if (task.state === 'pending' || task.state === 'running') {
+    meta = `${Math.floor(task.progress * 100)}% · ` + meta;
+  }
+  if (task.state === 'done') meta += ` · ${fmtBytes(task.blobSize)}`;
+  e.meta.textContent = meta;
+}
+
+function downloadName(task) {
+  const { snap, spec } = task;
+  return `export_${snap.a.toFixed(3)}s-${snap.b.toFixed(3)}s_` +
+    `${spec.sampleRate}Hz_${spec.channels}ch_${spec.bitDepth}.wav`;
+}
+
+function flashTask(task) {
+  const el = task.els && task.els.root;
+  if (!el) return;
+  el.classList.remove('flash');
+  void el.offsetWidth; // 重新触发动画
+  el.classList.add('flash');
+  el.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+}
+
+/* ---------- 导出表单 ---------- */
+
+$('#btnExport').addEventListener('click', () => {
+  const a = parseFloat($('#xStart').value), b = parseFloat($('#xEnd').value);
+  if (!isFinite(a) || !isFinite(b) || a < 0 || b <= a) {
+    alert('导出区间无效：请检查起止时间');
+    return;
+  }
+  enqueueExport(takeSnapshot(a, b), readExportSpec());
+});
+$('#xUseLoop').addEventListener('click', () => {
+  if (!state.loop) { alert('请先在标尺上拖出区间'); return; }
+  fillExportRange(state.loop.a, state.loop.b);
+});
+$('#xUseAll').addEventListener('click', () => {
+  const end = projectEnd();
+  if (end <= 0) { alert('时间线上还没有片段'); return; }
+  fillExportRange(0, end);
+});
+for (const id of ['xStart', 'xEnd', 'xRate', 'xCh', 'xBits']) {
+  $('#' + id).addEventListener('input', updateExportInfo);
+  $('#' + id).addEventListener('change', updateExportInfo);
+}
 
 /* ================= 启动 ================= */
 

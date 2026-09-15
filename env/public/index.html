@@ -50,13 +50,50 @@
       · 拖动片段本体 = 移动（淡化区间跟着走）<br>
       · 拖动片段两端 ◆ 柄 = 调淡入/淡出<br>
       · 标尺单击 = 定位播放头<br>
-      · 标尺上拖出区间 = 设置循环（吸附到采样）<br>
+      · 标尺上拖出区间 = 设置循环（吸附到采样），同时填入导出区间<br>
       · 空格 = 播放 / 暂停<br>
-      · 播放中可拖动尚未播到的片段，指针不会跳
+      · 播放中可拖动尚未播到的片段，指针不会跳<br>
+      · 导出在后台进行：提交后仍可继续编辑与预听，不影响任务结果
     </div>
+
+    <h2 class="sec">导出 WAV</h2>
+    <div id="exportBox">
+      <label>起始 (s) <input id="xStart" type="number" step="0.001" min="0" placeholder="0.000"></label>
+      <label>结束 (s) <input id="xEnd" type="number" step="0.001" min="0" placeholder="0.000"></label>
+      <div class="btnrow">
+        <button id="xUseLoop" title="把标尺上框选的区间填进来">用框选区间</button>
+        <button id="xUseAll" title="0 → 时间线末尾">整个项目</button>
+      </div>
+      <label>采样率
+        <select id="xRate">
+          <option>8000</option><option>16000</option><option>22050</option>
+          <option>24000</option><option>32000</option>
+          <option selected>44100</option><option>48000</option><option>96000</option>
+        </select>
+      </label>
+      <label>声道
+        <select id="xCh">
+          <option value="1">单声道</option>
+          <option value="2" selected>立体声</option>
+        </select>
+      </label>
+      <label>格式
+        <select id="xBits">
+          <option value="16" selected>16-bit PCM</option>
+          <option value="24">24-bit PCM</option>
+          <option value="32f">32-bit Float</option>
+        </select>
+      </label>
+      <button id="btnExport" class="primary">导出 WAV</button>
+      <div id="xInfo"></div>
+    </div>
+
+    <h2 class="sec">导出任务</h2>
+    <div id="tasks"><div id="tasksEmpty">本次会话还没有导出任务</div></div>
   </aside>
 </div>
 
+<script src="export-core.js"></script>
 <script src="app.js"></script>
 </body>
 </html>
