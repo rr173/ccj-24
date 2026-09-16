@@ -3,7 +3,8 @@
 /* ================= 全局状态 ================= */
 
 let ctx = null;          // AudioContext（首次交互时创建）
-let master = null;       // 主增益 → 压限 → 输出。所有片段在此汇合，重叠处自然按增益相加
+let master = null;       // 主增益 → 预览增益 → 压限 → 输出。所有片段在此汇合，重叠处自然按增益相加
+let previewGain = null;  // 响度提案试听节点（默认直通，非破坏）
 let comp = null;
 
 const LANE_H = 60;       // 每条泳道高度(px)，与 .clip 高度一致
@@ -52,7 +53,10 @@ function ensureCtx() {
   master = ctx.createGain();
   master.gain.value = 0.9;
   comp = ctx.createDynamicsCompressor(); // 重叠叠加时防止削波
-  master.connect(comp).connect(ctx.destination);
+  // 响度提案试听：previewGain → master → comp；默认直通，提案试听时改它（非破坏）
+  previewGain = ctx.createGain();
+  previewGain.gain.value = 1;
+  master.connect(previewGain).connect(comp).connect(ctx.destination);
 }
 
 /* 秒 → 吸附到整数采样后的秒 */
@@ -346,6 +350,38 @@ function layout() {
   $('#timeline').style.width = timelineWidth() + 'px';
   renderRuler();
   renderLoopRegion();
+  drawLoudnessOverlay();
+}
+
+/* ---------- 响度超限覆盖层 ---------- */
+function loudnessHitAt(clientX) {
+  const task = loudnessUI && loudnessUI.getCurrentTask && loudnessUI.getCurrentTask();
+  if (!task || !task.evaluation) return null;
+  for (const z of task.evaluation.zones || []) {
+    const x = (z.a - task.a) / (task.b - task.a) * timelineWidth();
+    const w = Math.max(3, (z.b - z.a) / (task.b - task.a) * timelineWidth());
+    if (clientX >= x && clientX <= x + w) return z;
+  }
+  return null;
+}
+function drawLoudnessOverlay() {
+  const cv = $('#loudoverlays');
+  if (!cv || !loudnessUI) return;
+  const width = timelineWidth();
+  const lanesH = Math.max(28, parseFloat($('#lanes').style.height) || LANE_H);
+  const dpr = self.devicePixelRatio || 1;
+  const cssH = lanesH + 28;
+  if (cv.width !== Math.round(width * dpr) || cv.height !== Math.round(cssH * dpr)) {
+    cv.width = Math.round(width * dpr); cv.height = Math.round(cssH * dpr);
+    cv.style.width = width + 'px'; cv.style.height = cssH + 'px';
+  }
+  const g = cv.getContext('2d');
+  g.setTransform(dpr, 0, 0, dpr, 0, 0);
+  g.clearRect(0, 0, width, cssH);
+  g.save();
+  g.translate(0, 28);
+  loudnessUI.drawOverlays(g, width);
+  g.restore();
 }
 
 function drawWave(clip) {
@@ -458,6 +494,19 @@ $('#ruler').addEventListener('pointerdown', e => {
     const r = ruler.getBoundingClientRect();
     return Math.max(0, (ev.clientX - r.left) / state.pps);
   };
+  // 点击响度超限区段：从该处试听（区段很窄时优先命中而不是开始框选）
+  if (loudnessUI && e.target === ruler) {
+    const r = ruler.getBoundingClientRect();
+    const x = e.clientX - r.left;
+    const task = loudnessUI.getCurrentTask && loudnessUI.getCurrentTask();
+    if (task && task.evaluation && task.evaluation.zones && task.evaluation.zones.length) {
+      const hit = loudnessHitAt(x);
+      if (hit) {
+        loudnessUI.onOverlayClick(x, timelineWidth());
+        return;
+      }
+    }
+  }
   const t0 = tOf(e);
   let moved = false; let draft = null;
   const move = ev => {
@@ -613,6 +662,70 @@ function rescheduleClipNow(clip) {
 function stopSources() {
   for (const e of state.scheduled) { try { e.src.stop(); } catch (_) {} }
   state.scheduled = [];
+}
+
+/* ================= 响度提案试听处理器（实时、非破坏） =================
+   插在 master 与 comp 之间，默认直通；接受/放弃时移除，片段参数始终不变。
+   - uniform：恒定增益 GainNode
+   - envelope：关键点线性 ramp（用核心同一份节点时间/值）
+   - limiter：前置增益 + DynamicsCompressor（试听近似；最终以离线度量为准） */
+let previewExtra = null;
+function attachPreviewProcessor(kind, params, rangeA, rangeB) {
+  detachPreviewProcessor();
+  ensureCtx();
+  const node = ctx.createGain(); node.gain.value = 1;
+  // 把原 master→previewGain 的连接改为经过 node
+  try { master.disconnect(previewGain); } catch (_) {}
+  master.connect(node).connect(previewGain);
+  previewExtra = { kind, node, rangeA, rangeB };
+  const now = ctx.currentTime;
+  if (kind === 'uniform') {
+    node.gain.setValueAtTime(Math.pow(10, params.gainDB / 20), now);
+  } else if (kind === 'envelope') {
+    const g0 = Math.pow(10, params.nodes[0].gainDB / 20);
+    node.gain.setValueAtTime(g0, now);
+    previewExtra.timer = setInterval(() => scheduleEnvelope(node, params), 200);
+    scheduleEnvelope(node, params);
+  } else if (kind === 'limiter') {
+    // 前置增益 + 压缩器（近似离线 4× 过采样限制器的听感）
+    const pre = ctx.createGain();
+    pre.gain.value = Math.pow(10, params.preGainDB / 20);
+    const lim = ctx.createDynamicsCompressor();
+    lim.threshold.value = params.ceilingDBTP - 1;
+    lim.knee.value = 0; lim.ratio.value = 20;
+    lim.attack.value = Math.max(0, params.attackSec || 0.0005);
+    lim.release.value = Math.max(0.01, params.releaseSec || 0.15);
+    // 输出回到 ceiling（compressor 不保证硬上限，补偿增益）
+    const makeup = ctx.createGain(); makeup.gain.value = Math.pow(10, (params.ceilingDBTP - 0) / 20);
+    try { master.disconnect(node); } catch (_) {}
+    master.connect(pre).connect(lim).connect(makeup).connect(previewGain);
+    previewExtra.node = node; previewExtra.chain = [pre, lim, makeup];
+  }
+}
+function scheduleEnvelope(node, params) {
+  if (!previewExtra) return;
+  const t = posNow();
+  const now = ctx.currentTime;
+  const ns = params.nodes;
+  // 找当前区间，ramp 到后续关键点（10s 窗口足够，定时器持续推进）
+  let i = 0; while (i < ns.length - 1 && t > ns[i + 1].t) i++;
+  const cur = ns[i], nxt = ns[Math.min(i + 1, ns.length - 1)];
+  const gNow = Math.pow(10, cur.gainDB / 20);
+  node.gain.cancelScheduledValues(now);
+  node.gain.setValueAtTime(gNow, now);
+  for (let k = i + 1; k < Math.min(ns.length, i + 40); k++) {
+    node.gain.linearRampToValueAtTime(Math.pow(10, ns[k].gainDB / 20), now + Math.max(0, ns[k].t - t));
+  }
+}
+function detachPreviewProcessor() {
+  if (!previewExtra) return;
+  if (previewExtra.timer) clearInterval(previewExtra.timer);
+  try {
+    master.disconnect();
+    // 重建到 previewGain 的直连
+    master.connect(previewGain);
+  } catch (_) {}
+  previewExtra = null;
 }
 
 function posNow() {
@@ -791,6 +904,8 @@ function afterEdit() {
   refreshHistoryPanels();
   updateUndoButtons();
   updateStatusSave();
+  // 工程已编辑：旧响度结果/提案标记过期（已完成段缓存按内容指纹自然复用）
+  if (loudnessUI) loudnessUI.onProjectEdited();
 }
 
 /* 低成本对齐：参数变化直接同步；增删导致数量变化才整体重建 DOM */
@@ -833,6 +948,7 @@ function postNavigation() {
   refreshHistoryPanels();
   updateUndoButtons();
   updateStatusSave();
+  if (loudnessUI) loudnessUI.onHistoryMove();
 }
 
 /* ================= 分支 ================= */
@@ -1215,7 +1331,7 @@ function toast(msg, cls) {
   t.textContent = msg; t.hidden = false;
   t.className = cls || '';
   clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => { t.hidden = true; }, 4200);
+  toastTimer = setTimeout(() => { t.hidden = true; }, 7000);
 }
 
 if (typeof window !== 'undefined' && window.addEventListener) {
@@ -1247,6 +1363,62 @@ function takeSnapshot(a, b) {
   clips.sort((x, y) => x.offset - y.offset || bufferUid(x.buffer) - bufferUid(y.buffer));
   return { a, b, clips };
 }
+
+/* 响度分析专用快照：与 takeSnapshot 相同的混音口径，但片段带 mediaHash
+   （内容指纹用于跨任务/编辑的分段缓存复用）。 */
+function takeLoudSnapshot(a, b) {
+  const clips = [];
+  for (const c of state.clips) {
+    if (!c.buffer) continue;
+    if (c.offset >= b || c.offset + c.duration <= a) continue;
+    clips.push({
+      name: c.name, buffer: c.buffer, mediaHash: c.mediaHash,
+      offset: c.offset, gain: c.gain, fadeIn: c.fadeIn, fadeOut: c.fadeOut, duration: c.duration,
+    });
+  }
+  clips.sort((x, y) => x.offset - y.offset || (x.mediaHash || '').localeCompare(y.mediaHash || ''));
+  return { a, b, clips };
+}
+
+/* 浏览器离线混音：与导出/播放同口径（重叠相加、淡化、线性重采样），48k 立体声/单声道 */
+function browserRenderMix(snap, t0, t1, channels, onChunk, sampleRate) {
+  return renderMix(snap, t0, t1, channels, onChunk, sampleRate, {
+    chunkFrames: 1 << 15,
+    yieldControl: () => new Promise(r => setTimeout(r, 0)),
+  });
+}
+
+/* 把非破坏提案参数落成「一次提交」的批量补丁。
+   - uniform：区间内每个片段按其覆盖时长加权应用同一 dB 增益（增益叠加在 gain 上）。
+   - envelope：片段中心时间落在包络哪个位置，就应用该处 dB（同样叠加在 gain 上）。
+   - limiter：实时/离线限制不能用纯片段增益等价表达；这里不直接改片段，
+     而是提示需要「烤轨为新片段」（保留非破坏语义），返回空补丁由 UI 引导。 */
+function buildProposalPatch(taskRange, params, kind, docClips) {
+  if (kind === 'limiter') return null; // 需烤轨；UI 另行处理（当前版本给出提示）
+  const { a, b } = taskRange;
+  const gainAt = t => {
+    if (kind === 'uniform') return params.gainDB;
+    const ns = params.nodes;
+    let i = 0; while (i < ns.length - 1 && t > ns[i + 1].t) i++;
+    const n0 = ns[i], n1 = ns[Math.min(i + 1, ns.length - 1)];
+    if (n1.t <= n0.t) return n0.gainDB;
+    const r = Math.min(1, Math.max(0, (t - n0.t) / (n1.t - n0.t)));
+    return n0.gainDB + (n1.gainDB - n0.gainDB) * r;
+  };
+  const patch = [];
+  for (const c of docClips || doc().clips) {
+    if (c.offset >= b || c.offset + c.duration <= a) continue;
+    // 以片段与区间重叠部分的中点取增益
+    const oa = Math.max(c.offset, a), ob = Math.min(c.offset + c.duration, b);
+    const mid = (oa + ob) / 2;
+    const db = gainAt(mid);
+    if (Math.abs(db) < 0.01) continue;
+    const newGain = Math.min(2, Math.max(0, c.gain * Math.pow(10, db / 20)));
+    patch.push({ op: 'update', id: c.id, set: { gain: newGain }, old: { gain: c.gain } });
+  }
+  return patch;
+}
+function doc() { return store ? store.eng.doc : window.doc(); }
 function specText(spec) {
   const bits = { '16': '16bit', '24': '24bit', '32f': '32f' }[spec.bitDepth];
   return `${spec.sampleRate}Hz · ${spec.channels === 1 ? '单声道' : '立体声'} · ${bits}`;
@@ -1425,6 +1597,54 @@ function encodeMonoPcm16Wav(f32, sampleRate) {
   return bytes;
 }
 
+/* ================= 响度检查 UI 接线 ================= */
+
+let loudnessUI = null;
+let loudTaskSeq = 0;
+
+function initLoudness() {
+  if (typeof createLoudnessUI !== 'function') return;
+  loudnessUI = createLoudnessUI({
+    $,
+    toast,
+    snapshot: takeLoudSnapshot,
+    projectEnd,
+    renderMix: browserRenderMix,
+    store,
+    timelineWidth,
+    timelineHeight: () => Math.max(28, parseFloat($('#lanes').style.height) || LANE_H) + 28,
+    redrawOverlays: drawLoudnessOverlay,
+    playFrom: (t) => { seek(t); play(); },
+    commitBatch: (patch, label) => {
+      if (patch && patch.length) commit(patch, { label });
+    },
+    attachPreviewProcessor: attachPreviewProcessor,
+    detachPreviewProcessor: detachPreviewProcessor,
+    buildProposalPatch: (task, params, kind) => {
+      const r = buildProposalPatch({ a: task.a, b: task.b }, params, kind);
+      return r;
+    },
+  });
+  loudnessUI.initManager();
+  if (IN_NODE_TEST) globalThis.__setLoudnessUIForTest(loudnessUI);
+
+  $('#btnLoud').addEventListener('click', () => loudnessUI.startCheck());
+  $('#lfUseLoop').addEventListener('click', () => {
+    if (!state.loop) { toast('请先在标尺上框选区间', 'warn'); return; }
+    $('#lfStart').value = state.loop.a.toFixed(3);
+    $('#lfEnd').value = state.loop.b.toFixed(3);
+  });
+  $('#lfUseAll').addEventListener('click', () => {
+    $('#lfStart').value = '0';
+    $('#lfEnd').value = projectEnd().toFixed(3);
+  });
+}
+
+async function restoreLoudnessTasks() {
+  if (!loudnessUI) return;
+  await loudnessUI.restoreTasks((a, b) => takeLoudSnapshot(a, b));
+}
+
 /* ================= 启动：打开存储 → 恢复素材 → 重建时间线 ================= */
 
 async function boot() {
@@ -1504,6 +1724,9 @@ async function boot() {
   updateStatusSave();
   store.onStatus(() => { updateStatusSave(); refreshHistoryPanels(); });
 
+  initLoudness();
+  await restoreLoudnessTasks();
+
   // 恢复问题 / 丢失操作明确告知
   if (rec.problems.length) {
     toast('恢复报告：' + rec.problems[0] + (rec.problems.length > 1 ? `（等 ${rec.problems.length} 条）` : ''), 'warn');
@@ -1552,4 +1775,9 @@ async function resetAppForTest() {
   updateUndoButtons();
   return store;
 }
-if (IN_NODE_TEST) { globalThis.bootAppForTest = bootAppForTest; globalThis.resetAppForTest = resetAppForTest; }
+if (IN_NODE_TEST) {
+  globalThis.bootAppForTest = bootAppForTest;
+  globalThis.resetAppForTest = resetAppForTest;
+  globalThis.historyUndoDepth = () => store.eng ? historyUndoDepth() : 0;
+  globalThis.__setLoudnessUIForTest = ui => { globalThis.__loudnessUIForTest = ui; };
+}

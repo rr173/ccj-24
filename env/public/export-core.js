@@ -222,11 +222,40 @@
     return { canceled: false, parts, frames: N };
   }
 
+  /* 离线混音到任意 [t0,t1)，按块回调交错 PCM。响度分析共用这一条混音路径，
+     因此分析与实际播放/导出反映同样的重叠、增益、淡化与重采样。
+     onChunk 可以返回 Promise（响度分析借此在块边界暂停/取消）；这里必须 await。 */
+  async function renderMix(snap, t0, t1, outCh, onChunk, outSR, opts) {
+    opts = opts || {};
+    const sr = outSR || 48000;
+    const N = Math.round((t1 - t0) * sr);
+    if (!(N > 0)) throwMsg('渲染区间无效');
+    const srcs = snap.clips
+      .filter(c => c.offset < t1 && c.offset + c.duration > t0)
+      .map(c => prepSource(c, outCh));
+    const chunkFrames = opts.chunkFrames || (1 << 15);
+    let done = 0;
+    while (done < N) {
+      if (opts.shouldCancel && opts.shouldCancel()) return { canceled: true, frames: N };
+      const frames = Math.min(chunkFrames, N - done);
+      const mix = new Float32Array(frames * outCh);
+      const ct0 = t0 + done / sr;
+      for (const s of srcs) {
+        if (s.ce <= ct0 || s.cs >= ct0 + frames / sr) continue;
+        accumulate(s, mix, ct0, frames, sr);
+      }
+      await onChunk(mix);
+      done += frames;
+      if (opts.yieldControl) await opts.yieldControl();
+    }
+    return { canceled: false, frames: N };
+  }
+
   return {
     IS_LE, throwMsg, friendlyError,
     bytesPerFrame, fmtBytes,
     bufferUid, snapshotFingerprint,
     buildChannelMap, prepSource, accumulate,
-    buildWavHeader, encodeChunk, renderWav,
+    buildWavHeader, encodeChunk, renderWav, renderMix,
   };
 });

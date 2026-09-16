@@ -342,6 +342,12 @@
     function putMedia(hash, bytes) { return wal.putBlob(hash, bytes); }
     function hasMedia(hash) { return wal.hasBlob(hash); }
     function getMedia(hash) { return wal.getMedia ? wal.getMedia(hash) : wal.getBlob(hash); }
+
+    /* 响度分段缓存（CRC 帧直存 KV，不进 WAL 操作流；丢失只触发重算） */
+    function putLoudSegment(fp, bytes) { return wal.putSegment(fp, bytes); }
+    function getLoudSegment(fp) { return wal.getSegment(fp); }
+    function hasLoudSegment(fp) { return wal.hasSegment(fp); }
+    function clearLoudSegments() { return wal.clearSegments(); }
     function hashArrayBuffer(ab) { return W.hashBytes(new Uint8Array(ab)); }
 
     function markMedia(hash, set, label) {
@@ -370,6 +376,7 @@
     return {
       open, commit, persistPosition, persistMeta,
       putMedia, hasMedia, getMedia, hashArrayBuffer, markMedia,
+      putLoudSegment, getLoudSegment, hasLoudSegment, clearLoudSegments,
       maybeCompact, flush, dirty, onStatus, dismissFailure, status,
       get eng() { return eng; },
       get seq() { return seq; },

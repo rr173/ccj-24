@@ -44,6 +44,7 @@
     <div id="timeline">
       <canvas id="ruler"></canvas>
       <div id="loopregion"></div>
+      <canvas id="loudoverlays"></canvas>
       <div id="lanes"></div>
       <div id="playhead"></div>
     </div>
@@ -136,12 +137,34 @@
 
     <h2 class="sec">导出任务</h2>
     <div id="tasks"><div id="tasksEmpty">本次会话还没有导出任务</div></div>
+
+    <h2 class="sec">响度检查 / 修正</h2>
+    <div id="loudBox">
+      <label>规范
+        <select id="lfPreset">
+          <option value="r128">EBU R128（−23 LUFS / −1 dBTP）</option>
+          <option value="stream" selected>流媒体通用（−14 LUFS / −1 dBTP）</option>
+          <option value="podcast">播客（−16 LUFS / −1 dBTP）</option>
+        </select>
+      </label>
+      <label>起始 (s) <input id="lfStart" type="number" step="0.001" min="0" placeholder="0.000"></label>
+      <label>结束 (s) <input id="lfEnd" type="number" step="0.001" min="0" placeholder="自动"></label>
+      <div class="btnrow">
+        <button id="lfUseLoop" title="用标尺上框选的区间">用框选区间</button>
+        <button id="lfUseAll" title="0 → 时间线末尾">整个项目</button>
+      </div>
+      <button id="btnLoud" class="primary">开始响度检查</button>
+      <div id="lfTasks"></div>
+    </div>
   </aside>
 </div>
 
 <div id="toast" hidden></div>
 
 <script src="export-core.js"></script>
+<script src="loudness-core.js"></script>
+<script src="loudness-app.js"></script>
+<script src="loudness-ui.js"></script>
 <script src="history-core.js"></script>
 <script src="wal-core.js"></script>
 <script src="idb-kv.js"></script>

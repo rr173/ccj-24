@@ -322,6 +322,26 @@
       return ks.map(k => k.slice(BLOB_PREFIX.length));
     }
 
+    /* ---------- 响度分段缓存（独立键空间，不占操作帧 seq） ---------- */
+    const LUFS_PREFIX = 'lufs/seg/';
+    function segCacheKey(fp) { return LUFS_PREFIX + fp; }
+    async function putSegment(fp, bytes) {
+      await kvPut(segCacheKey(fp), bytes);
+      return true;
+    }
+    async function getSegment(fp) {
+      const v = await kv.get(segCacheKey(fp));
+      return v == null ? null : asBytes(v);
+    }
+    async function hasSegment(fp) { return (await kv.get(segCacheKey(fp))) != null; }
+    async function deleteSegment(fp) { await kv.del(segCacheKey(fp)); }
+    /* 删除全部响度缓存段（任务整体失效时用） */
+    async function clearSegments() {
+      const ks = await kv.keys(LUFS_PREFIX);
+      for (const k of ks) await kv.del(k);
+      return ks.length;
+    }
+
     async function kvPut(k, v) {
       try {
         if (kv.putMany && kv.putMany.length === 1) { /* putMany 可选批量；这里单键 */ }
@@ -337,6 +357,7 @@
     return {
       open, append, writeSnapshot, cleanupOldFrames, flush,
       hasBlob, getBlob, putBlob, delBlob, blobHashes,
+      putSegment, getSegment, hasSegment, deleteSegment, clearSegments,
       status, on, _kv: kv,
     };
   }
