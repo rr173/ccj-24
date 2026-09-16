@@ -1,0 +1,192 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>MIDI 遥控台</title>
+<link rel="stylesheet" href="midi-console.css">
+</head>
+<body>
+<header id="topbar">
+  <div class="brand">🎛 MIDI 遥控台</div>
+  <span id="midiPerm" class="pill pill-warn" title="Web MIDI 访问状态">MIDI 未连接</span>
+  <button id="btnMidi">请求 MIDI 权限</button>
+  <span class="sep"></span>
+  <button id="btnPair" class="pair-btn">◎ 配对模式：关</button>
+  <span id="pairHint" class="hint" hidden>配对中：先点一个软件控件，再转动硬件旋钮/推子</span>
+  <span class="sep"></span>
+  <span class="hint">工程指纹</span>
+  <code id="projectFp" title="草稿 take 必须与当前工程指纹一致才可采纳">—</code>
+  <button id="btnRotateFp" title="模拟工程变化（旧工程草稿只供监听、不可采纳）">⟳ 换工程</button>
+  <span class="spacer"></span>
+  <button id="btnUndo" title="采纳 take 形成单个撤销单元">↶ 撤销</button>
+  <button id="btnHelp">帮助</button>
+</header>
+
+<div id="suspendBanner" hidden>
+  <b>采集已挂起</b>
+  <span id="suspendReason"></span>
+  <button id="btnResume">续接本 take</button>
+  <button id="btnRestart">另起一遍</button>
+  <span class="hint">（重连后由你决定，不会自动恢复）</span>
+</div>
+
+<div id="conflictBar" hidden>
+  <span>该硬件消息已有绑定：<code id="conflictKey"></code></span>
+  <button id="btnConflictReplace">替换（旧绑定移走）</button>
+  <button id="btnConflictShare">共享（多控件共用此消息）</button>
+  <button id="btnConflictCancel">放弃</button>
+</div>
+
+<div class="layout">
+
+  <!-- 左列：端口 + 绑定表 -->
+  <section class="col col-left">
+    <div class="card">
+      <h2>端口健康 <span id="portClock" class="mono small"></span></h2>
+      <div id="portList" class="port-list">
+        <div class="muted small">尚无 MIDI 输入。下方虚拟设备可在无硬件时体验全部流程。</div>
+      </div>
+      <div class="card-actions">
+        <button id="btnAddVirtual">＋ 虚拟设备 FauxFab VC-1</button>
+        <button id="btnAddTwin" title="再插一台同型号机器，验证严禁串台">＋ 同型号第二台</button>
+      </div>
+      <div class="small muted">身份 = 稳定 id + 名称/厂牌指纹；只认同一 id，缺席端口保持离线，绝不串到同型号另一台。</div>
+    </div>
+
+    <div class="card grow">
+      <h2>绑定 <span id="bindCount" class="muted small"></span></h2>
+      <div id="bindingList" class="bind-list">
+        <div class="muted small">还没有绑定。开启配对模式后触碰控件再动硬件即可建立。</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- 中列：软件控件 -->
+  <section class="col col-mid">
+    <div class="card">
+      <h2>软件控件台</h2>
+      <div id="rack" class="rack"></div>
+      <div class="small muted">
+        配对模式下点控件 = 选定待绑目标（紫色描边）；非配对模式下鼠标拖拽控件改现场值。
+        采集期间鼠标触碰已武装控件会圈出争议范围。
+      </div>
+    </div>
+
+    <div class="card grow transport-card">
+      <h2>走带与采集</h2>
+      <div class="transport-row">
+        <button id="btnPlay" class="big">▶ 播放</button>
+        <button id="btnStop" class="big">⏹ 停止</button>
+        <span class="mono clock" id="clockMain">00:00.00</span>
+        <span class="hint">调度延迟</span><span id="schedLag" class="mono small">0 ms</span>
+      </div>
+      <div class="transport-row">
+        <span class="hint">写入方式</span>
+        <label class="seg"><input type="radio" name="writemode" value="overwrite" checked>覆盖</label>
+        <label class="seg"><input type="radio" name="writemode" value="latch">锁存</label>
+        <label class="seg"><input type="radio" name="writemode" value="touch">触碰</label>
+        <span class="sep"></span>
+        <span class="hint">平滑</span>
+        <input id="smoothAmt" type="range" min="0" max="95" value="55">
+        <span id="smoothVal" class="mono small">55%</span>
+        <label class="seg"><input id="clipOOB" type="checkbox" checked>越界裁切</label>
+      </div>
+      <div class="transport-row">
+        <button id="btnArmAll">全选武装</button>
+        <button id="btnArmNone">解除武装</button>
+        <span class="sep"></span>
+        <button id="btnCapture" class="capture">● 采集一遍手势</button>
+        <span id="captureState" class="hint"></span>
+      </div>
+      <div class="transport-row">
+        <span class="hint">循环监听</span>
+        <button id="btnLoop">循环：关</button>
+        <input id="loopIn" class="mono small tbox" type="number" step="0.1" min="0" placeholder="入">
+        <input id="loopOut" class="mono small tbox" type="number" step="0.1" min="0" placeholder="出">
+      </div>
+    </div>
+  </section>
+
+  <!-- 右列：take + 采纳 -->
+  <section class="col col-right">
+    <div class="card grow">
+      <h2>Take（草稿/已存） <span id="takeCount" class="muted small"></span></h2>
+      <div id="takeList" class="take-list">
+        <div class="muted small">武装若干绑定 → 播放 → 采集。多个 take 可分别监听、按范围拼选。</div>
+      </div>
+    </div>
+    <div class="card">
+      <h2>拼选与采纳</h2>
+      <div id="compStatus" class="small">未选择范围。</div>
+      <div class="stack">
+        <div class="row">
+          <span class="hint">争议策略</span>
+          <label class="seg"><input type="radio" name="dispute" value="live" checked>保留现场值</label>
+          <label class="seg"><input type="radio" name="dispute" value="take">套入 take</label>
+          <label class="seg"><input type="radio" name="dispute" value="clean">仅无争议</label>
+        </div>
+        <div class="row">
+          <button id="btnCompClear">清除拼选</button>
+          <button id="btnAdopt" class="primary">采纳为单个撤销单元</button>
+        </div>
+      </div>
+    </div>
+  </section>
+</div>
+
+<!-- 时间线 -->
+<section class="timeline-wrap">
+  <div class="tl-toolbar">
+      <span class="hint">自动化时间线</span>
+      <button id="btnMarkIn" title="用当前播放头位置">[ 入点</button>
+      <button id="btnMarkOut">] 出点</button>
+      <span class="mono small" id="markInfo"></span>
+      <span class="spacer"></span>
+      <span class="hint">缩放</span>
+      <input id="tlZoom" type="range" min="40" max="600" value="120">
+      <span class="legend">
+        <i class="sw sw-lane"></i>已采纳
+        <i class="sw sw-take"></i>可采纳范围
+        <i class="sw sw-disp"></i>争议
+        <i class="sw sw-gap"></i>掉线缺口
+        <i class="sw sw-cursor"></i>播放头
+      </span>
+  </div>
+  <div id="tlScroll"><canvas id="tlCanvas"></canvas></div>
+</section>
+
+<div id="helpOverlay" hidden>
+  <div class="help-box">
+    <h2>操作说明</h2>
+    <ul>
+      <li><b>配对</b>：点「配对模式」，点一个软件控件（描边），再转动同一项硬件旋钮/推子；CC 值需变化两次以确认。</li>
+      <li><b>消息冲突</b>：同一 (端口,通道,CC) 再配对时选择替换 / 共享 / 放弃。</li>
+      <li><b>稳定身份</b>：只按端口稳定 id 重认；「同型号第二台」是另一个 id，永远不会接管旧绑定。</li>
+      <li><b>采集</b>：勾选绑定上的 R 武装 → 播放 →「采集一遍手势」。硬件时间戳投射到工程时钟；密集事件不会因卡顿堆到单点。</li>
+      <li><b>写入方式</b>：覆盖=整段；锁存=动手后持续到停止；触碰=只在实际手势期间写入。</li>
+      <li><b>争议</b>：采集期间鼠标碰了同一控件（或素材坐标被拖动），相关时段标红，按争议策略决定。</li>
+      <li><b>挂起</b>：拔线 / 标签页失焦 / 节流立即挂起；重连后手动选择续接本 take 或另起一遍。</li>
+      <li><b>拼选</b>：在 take 行（或时间线泳道）上拖选区间，可跨多个 take 拼选；采纳合并为一个撤销单元。</li>
+      <li><b>持久化</b>：配对表、武装、草稿 take 存 localStorage；换工程后旧指纹草稿只可监听。</li>
+      <li><b>无硬件</b>：用「＋ 虚拟设备」面板上的推子发 CC；高频流自动平滑、首尾值保留。</li>
+    </ul>
+    <button id="btnHelpClose">知道了</button>
+  </div>
+</div>
+
+<div id="toast"></div>
+
+<!-- 纯逻辑核心，顺序加载，便于 Node 直接测试 -->
+<script src="midi-util.js"></script>
+<script src="midi-store.js"></script>
+<script src="midi-mapping.js"></script>
+<script src="midi-midi.js"></script>
+<script src="midi-clock.js"></script>
+<script src="midi-engine.js"></script>
+<script src="midi-transport.js"></script>
+<script src="midi-timeline.js"></script>
+<script src="midi-ui.js"></script>
+<script src="midi-main.js"></script>
+</body>
+</html>
