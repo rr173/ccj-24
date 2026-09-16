@@ -53,8 +53,15 @@
     const body = snap.clips.map(c => [
       bufferUid(c.buffer), num(c.offset), num(c.gain),
       num(c.fadeIn), num(c.fadeOut), num(c.duration),
+      autoFingerprint(c.autoGain),
     ].join(',')).join(';');
     return head + '#' + body;
+  }
+
+  /* 增益自动化指纹：节点时间/值（无曲线时为空） */
+  function autoFingerprint(auto) {
+    if (!Array.isArray(auto) || !auto.length) return '';
+    return auto.slice().sort((p, q) => p.t - q.t).map(n => (+n.t.toFixed(6)) + ':' + (+n.g.toFixed(6))).join('|');
   }
 
   /* ---------- 声道布局统一 ----------
@@ -93,18 +100,35 @@
     // 淡化规则与预听一致：fi+fo 超过时长时按比例压缩
     let fi = Math.min(sc.fadeIn, sc.duration), fo = Math.min(sc.fadeOut, sc.duration);
     if (fi + fo > sc.duration) { const k = sc.duration / (fi + fo); fi *= k; fo *= k; }
+    // 片段增益自动化（响度提案落地）：节目时间上的分段线性线性增益；曲线外恒为 1
+    let auto = null;
+    if (Array.isArray(sc.autoGain) && sc.autoGain.length) {
+      auto = sc.autoGain.slice().sort((p, q) => p.t - q.t);
+    }
     return {
       data, map, inSR, len,
       cs: sc.offset, ce: sc.offset + sc.duration,
-      gain: sc.gain, fi, fo,
+      gain: sc.gain, fi, fo, auto,
     };
+  }
+
+  /* 增益自动化取值（增益域分段线性，曲线范围外 = 1，与播放侧 scheduleClip 同语义） */
+  function autoGainAt(auto, t) {
+    if (t <= auto[0].t) return t < auto[0].t ? 1 : auto[0].g;
+    const last = auto[auto.length - 1];
+    if (t >= last.t) return t > last.t ? 1 : last.g;
+    let i = 0;
+    while (i < auto.length - 2 && t > auto[i + 1].t) i++;
+    const n0 = auto[i], n1 = auto[i + 1];
+    const r = (t - n0.t) / (n1.t - n0.t);
+    return n0.g + (n1.g - n0.g) * r;
   }
 
   /* 把一个源在时间轴区间 [chunkT0, chunkT0 + frames/outSR) 内的贡献累加进 mix。
      输出第 i 帧 ↔ 时间轴 t = chunkT0 + i/outSR（绝对坐标计算，无累积误差）；
      源采样位置 = (t − 片段起点) × 源采样率，线性插值统一到输出采样率。 */
   function accumulate(src, mix, chunkT0, frames, outSR) {
-    const { data, map, inSR, len, cs, ce, gain, fi, fo } = src;
+    const { data, map, inSR, len, cs, ce, gain, fi, fo, auto } = src;
     const outCh = map.length;
     const fiEnd = cs + fi, foStart = ce - fo;
     // t ∈ [cs, ce) ⇒ i ∈ [(cs−chunkT0)·outSR, (ce−chunkT0)·outSR)
@@ -115,6 +139,7 @@
       let g = gain;
       if (fi > 1e-9 && t < fiEnd) g *= Math.max(0, (t - cs) / fi);
       if (fo > 1e-9 && t > foStart) g *= Math.max(0, (ce - t) / fo);
+      if (auto) g *= autoGainAt(auto, t);
       if (g === 0) continue;
       const pos = (t - cs) * inSR;
       const idx = Math.floor(pos);

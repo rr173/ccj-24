@@ -440,5 +440,118 @@ function steadyGain(coef, f, sr) {
     approx(multi.metrics.lra, single.metrics.lra, 0.4, 'lra');
   });
 
+  /* ---------- 提案增益曲线：试听/落地同源、只作用框内 ---------- */
+
+  async function renderRms(snap, t0, t1, ch) {
+    const parts = [];
+    await EC.renderMix(snap, t0, t1, ch || 1, m => parts.push(m), ANALYSIS_SR,
+      { chunkFrames: 1 << 14, yieldControl: () => Promise.resolve() });
+    let sum = 0, cnt = 0;
+    for (const p of parts) for (const v of p) { sum += v * v; cnt++; }
+    return Math.sqrt(sum / cnt);
+  }
+  async function renderMaxAbs(snap, t0, t1, ch) {
+    const parts = [];
+    await EC.renderMix(snap, t0, t1, ch || 1, m => parts.push(m), ANALYSIS_SR,
+      { chunkFrames: 1 << 14, yieldControl: () => Promise.resolve() });
+    let mx = 0;
+    for (const p of parts) for (const v of p) mx = Math.max(mx, Math.abs(v));
+    return mx;
+  }
+
+  await test('提案导出增益曲线：统一增益只覆盖框选区间，框外严格为 1', async () => {
+    const buf = sineBuf(997, 8, ANALYSIS_SR, ampForLevel(-18));
+    const c0 = clip({ buffer: buf, duration: 8, _hid: 30 });
+    const snap = snapshot(2, 6, [c0]);
+    const before = await analyzeAll(snap, PRESETS.stream);
+    const prop = planUniform(before.metrics, PRESETS.stream);
+    const r = await evaluateProposal(snap, 2, 6, prop, PRESETS.stream, makeRenderDeps(), {});
+    assert.strictEqual(r.gainNodes.length, 2);
+    approx(r.gainNodes[0].t, 2, 1e-6); approx(r.gainNodes[1].t, 6, 1e-4);
+    const g = r.gainNodes[0].g;
+    assert.ok(Math.abs(g - Math.pow(10, prop.gainDB / 20)) < 1e-9);
+    // 落地为片段 autoGain：框内 RMS 按比例变化，框外逐口径不变
+    const landed = clip({ buffer: buf, duration: 8, _hid: 30, autoGain: r.gainNodes });
+    const outBefore = await renderRms(snapshot(0, 8, [c0]), 0, 2);
+    const outAfter = await renderRms(snapshot(0, 8, [landed]), 0, 2);
+    approx(outAfter, outBefore, 1e-9, '框外电平不变');
+    const inBefore = await renderRms(snapshot(0, 8, [c0]), 2, 6);
+    const inAfter = await renderRms(snapshot(0, 8, [landed]), 2, 6);
+    assert.ok(Math.abs(inAfter / inBefore - g) < 1e-4, `框内按 g=${g.toFixed(3)} 缩放，实际 ${inAfter / inBefore}`);
+  });
+
+  await test('包络提案落地保留曲线形状（不退化成整段恒定）且只作用框内', async () => {
+    const sr = ANALYSIS_SR, n = 8 * sr;
+    const d = new Float32Array(n);
+    for (let i = 0; i < n; i++) {
+      const db = i < n / 2 ? -22 : -10;
+      d[i] = Math.sin(2 * Math.PI * 330 * i / sr) * Math.pow(10, db / 20);
+    }
+    const buf = fakeBuffer([d], sr);
+    const c0 = clip({ buffer: buf, duration: 8, _hid: 31 });
+    const snap = snapshot(2, 6, [c0]);
+    const before = await analyzeAll(snap, PRESETS.stream);
+    const prop = planEnvelope(before.metrics, PRESETS.stream);
+    const r = await evaluateProposal(snap, 2, 6, prop, PRESETS.stream, makeRenderDeps(), {});
+    assert.ok(r.gainNodes.length >= 3, '曲线有多个不同增益点，不是恒定值: ' + r.gainNodes.length);
+    const gMin = Math.min(...r.gainNodes.map(x => x.g));
+    const gMax = Math.max(...r.gainNodes.map(x => x.g));
+    assert.ok(gMax / gMin > 1.5, `曲线确实起伏（前轻后响）：${gMin.toFixed(3)}..${gMax.toFixed(3)}`);
+    // 框外不变
+    const landed = clip({ buffer: buf, duration: 8, _hid: 31, autoGain: r.gainNodes });
+    const outBefore = await renderRms(snapshot(0, 8, [c0]), 6, 8);
+    const outAfter = await renderRms(snapshot(0, 8, [landed]), 6, 8);
+    approx(outAfter, outBefore, 1e-9, '框外电平不变');
+    // 曲线形状：框内前半（原过轻）提升大于后半
+    const firstQ = await renderRms(snapshot(0, 8, [landed]), 2, 3);
+    const lastQ = await renderRms(snapshot(0, 8, [landed]), 5, 6);
+    const firstQ0 = await renderRms(snapshot(0, 8, [c0]), 2, 3);
+    const lastQ0 = await renderRms(snapshot(0, 8, [c0]), 5, 6);
+    assert.ok(firstQ / firstQ0 > lastQ / lastQ0 * 1.2, '轻段提升明显大于响段');
+  });
+
+  await test('限制器提案导出实际增益曲线，可确认/落地，落地后不削波且框外零变化', async () => {
+    const sr = ANALYSIS_SR, n = 6 * sr;
+    const d = new Float32Array(n);
+    const base = ampForLevel(-14);
+    for (let i = 0; i < n; i++) {
+      let v = base * Math.sin(2 * Math.PI * 997 * i / sr);
+      if (i % Math.round(sr / 2) < 12) v += 0.75 * Math.sin(2 * Math.PI * 2000 * i / sr);
+      d[i] = v;
+    }
+    const buf = fakeBuffer([d], sr);
+    const c0 = clip({ buffer: buf, duration: 6, _hid: 32 });
+    const snap = snapshot(0, 6, [c0]);
+    const before = await analyzeAll(snap, PRESETS.stream);
+    const prop = planLimiter(before.metrics, PRESETS.stream);
+    const r = await evaluateProposal(snap, 0, 6, prop, PRESETS.stream, makeRenderDeps(1 << 12), {});
+    assert.strictEqual(r.feasible, true, '可行提案可确认');
+    assert.ok(r.gainNodes.some(x => x.g < 0.999), '曲线记录了真实衰减');
+    // 落地（autoGain）后峰值不超过上限
+    const landed = clip({ buffer: buf, duration: 6, _hid: 32, autoGain: r.gainNodes });
+    const peak = await renderMaxAbs(snapshot(0, 6, [landed]), 0, 6);
+    const peakDB = 20 * Math.log10(peak);
+    assert.ok(peakDB <= PRESETS.stream.maxTP + 0.25, '落地后不削波: ' + peakDB);
+    // 局部框选 2..4：框外逐样本不变
+    const r2 = await evaluateProposal(snap, 2, 4, prop, PRESETS.stream, makeRenderDeps(1 << 12), {});
+    const local = clip({ buffer: buf, duration: 6, _hid: 32, autoGain: r2.gainNodes });
+    const a = [], b = [];
+    await EC.renderMix(snapshot(0, 6, [local]), 0, 2, 1, m => a.push(m.slice()), ANALYSIS_SR);
+    await EC.renderMix(snapshot(0, 6, [c0]), 0, 2, 1, m => b.push(m.slice()), ANALYSIS_SR);
+    let diff = 0;
+    for (let i = 0; i < a[0].length; i++) diff += Math.abs(a[0][i] - b[0][i]);
+    assert.strictEqual(diff, 0, '框外逐样本完全不变');
+  });
+
+  await test('autoGain 进入片段指纹：改动曲线后分段缓存/导出指纹必须失效', () => {
+    const buf = sineBuf(997, 4, ANALYSIS_SR, 0.5);
+    const c1 = clip({ buffer: buf, duration: 4, _hid: 40, gain: 1 });
+    const c2 = clip({ buffer: buf, duration: 4, _hid: 40, gain: 1, autoGain: [{ t: 1, g: 0.5 }, { t: 2, g: 0.5 }] });
+    assert.notStrictEqual(clipFingerprint(c1), clipFingerprint(c2));
+    const fp1 = EC.snapshotFingerprint(snapshot(0, 4, [c1]), { sampleRate: 48000, channels: 1, bitDepth: '16' });
+    const fp2 = EC.snapshotFingerprint(snapshot(0, 4, [c2]), { sampleRate: 48000, channels: 1, bitDepth: '16' });
+    assert.notStrictEqual(fp1, fp2);
+  });
+
   console.log(passed + ' 项 loudness-core 测试通过');
 })().catch(err => { console.error(err); process.exit(1); });

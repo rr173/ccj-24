@@ -250,8 +250,9 @@
       if (r && r.status === 'done') {
         const active = task.activeProposalId === prop.id;
         addBtn(active ? '停止试听（回到原声）' : '试听修正声', () => togglePreview(task, prop));
-        const canApply = r.feasible && !prop.stale && prop.kind !== 'limiter';
-        addBtn(prop.kind === 'limiter' ? '接受（限制器需烤轨，见试听）' : '接受（一次批量编辑）',
+        // 三类提案都已等价为框内增益曲线：评估可行即可一次批量编辑落地（含真峰值限制）
+        const canApply = r.feasible && !prop.stale && Array.isArray(r.gainNodes);
+        addBtn('接受（一次批量编辑，只作用于框内）',
           () => acceptProposal(task, prop), !canApply);
         addBtn('放弃', () => { manager.discardProposal(task.id, prop.id); renderTaskCard(); stopPreview(); });
       } else if (prop.status === 'evaluating') {
@@ -297,9 +298,14 @@
 
     function togglePreview(task, prop) {
       if (task.activeProposalId === prop.id) { stopPreview(); return; }
+      if (!prop.result || !Array.isArray(prop.result.gainNodes)) {
+        ctx.toast('提案尚未完成评估，无法试听', 'err');
+        return;
+      }
       stopPreview();
       previewProposal = prop;
-      ctx.attachPreviewProcessor(prop.kind, prop.params, task.a, task.b);
+      // 试听曲线与离线评估/落地同一份节点：框内分段线性、框外恒 1，逐片段叠加（非破坏）
+      ctx.attachPreviewProcessor(prop.kind, prop.params, task.a, task.b, prop.result.gainNodes);
       manager.setActiveProposal(task.id, prop.id);
       renderTaskCard();
     }
@@ -318,16 +324,12 @@
       let accepted;
       try { accepted = manager.acceptProposal(task.id, prop.id); }
       catch (e) { ctx.toast(e.message, 'err'); return; }
-      // 把非破坏提案落成一次提交的批量补丁
-      if (prop.kind === 'limiter') {
-        ctx.toast('真峰值限制需要烤轨为新素材才能保持精确 dBTP；请用「试听修正声」确认听感，或改用可直接批量编辑的统一增益/分段包络。', 'warn');
-        return;
-      }
-      const patch = ctx.buildProposalPatch(task, prop.params, prop.kind);
+      // 提案已等价为框内增益曲线：落成一次提交的批量 autoGain 补丁（播放/导出/分析同口径）
+      const patch = ctx.buildProposalPatch(task, prop.params, prop.kind, accepted.result);
       if (!patch || !patch.length) { ctx.toast('该提案没有可应用的参数变化'); return; }
       commitBatch(patch, proposalLabel(prop.kind));
       stopPreview();
-      ctx.toast(`已应用「${kindLabel(prop.kind)}」修正（一次批量编辑，可撤销）`);
+      ctx.toast(`已应用「${kindLabel(prop.kind)}」修正（只作用于框选区间，一次批量编辑，可撤销）`);
       // 接受后任务过期（混音已改变）
       manager.markStaleAfterEdit('已应用响度修正提案');
       renderTaskCard(); redrawOverlays();

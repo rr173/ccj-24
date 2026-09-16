@@ -314,7 +314,11 @@
   }
   function clipFingerprint(c) {
     const mid = c.mediaHash || ('buf:' + bufUid(c.buffer));
-    return [mid, num(c.offset), num(c.gain), num(c.fadeIn), num(c.fadeOut), num(c.duration)].join(',');
+    const auto = Array.isArray(c.autoGain) && c.autoGain.length
+      ? c.autoGain.slice().sort((p, q) => p.t - q.t)
+        .map(n => (+(+n.t).toFixed(6)) + ':' + (+(+n.g).toFixed(6))).join('|')
+      : '';
+    return [mid, num(c.offset), num(c.gain), num(c.fadeIn), num(c.fadeOut), num(c.duration), auto].join(',');
   }
 
   /* 分段与核心区子块网格对齐：段长取整到 100ms，跨段子块索引连续可直接合并 */
@@ -476,6 +480,8 @@
     let maxReduction = 0, maxInputPeak = 0;
     // 过采样真峰值状态跨块连续（块边界处的样本间峰不能漏）
     const tp = tpState(ch);
+    // 全速率输出增益记录（按输出帧时间连续）：供提案导出曲线（试听/落地同一来源）
+    const gainLog = params.recordGain ? [] : null;
 
     function processWindow(all, frames) {
       // 1) 每帧 4× 过采样真峰值（插值器状态跨块连续）
@@ -499,6 +505,7 @@
         if (1 - env > maxReduction) maxReduction = 1 - env;
         gain[n] = env;
       }
+      if (gainLog) for (let n = 0; n < frames; n++) gainLog.push(gain[n]);
       const out = new Float32Array(frames * ch);
       for (let n = 0; n < frames; n++) {
         for (let c = 0; c < ch; c++) out[n * ch + c] = all[n * ch + c] * gain[n];
@@ -528,6 +535,7 @@
         return out;
       },
       stats: () => ({ maxReduction, maxInputPeak, ceilLin, look }),
+      gainLog,
     };
   }
 
@@ -576,6 +584,77 @@
     };
   }
 
+  /* ---------- 提案增益曲线（试听与落地共用，保证所听即所得） ----------
+     三类提案都等价于「节目时间上的一条标量增益曲线 G(t)」：
+       uniform：框内恒定；envelope：关键点 dB（增益域线性）；limiter：限制器实际增益。
+     标量后乘对求和可分配：g(t)·Σxᵢ(t) = Σ g(t)·xᵢ(t)，所以重叠片段各自乘同一条 g(t)
+     与总线处理结果逐样本一致——无需烤轨也能精确落地，且框外 G≡1 完全不动。
+     返回的节点均为线性增益、节目绝对时间，恰好覆盖 [a,b]；框外由播放/渲染侧按 1 处理。 */
+  function proposalGainNodes(proposal, a, b, limLog) {
+    if (proposal.kind === 'uniform') {
+      const g = Math.pow(10, proposal.gainDB / 20);
+      return [{ t: num(a), g }, { t: num(b), g }];
+    }
+    if (proposal.kind === 'envelope') {
+      const src = proposal.nodes.slice().sort((p, q) => p.t - q.t);
+      const dbAt = (t) => {
+        let i = 0;
+        while (i < src.length - 1 && t > src[i + 1].t) i++;
+        const n0 = src[i], n1 = src[Math.min(i + 1, src.length - 1)];
+        if (n1.t <= n0.t) return n0.gainDB;
+        const r = Math.min(1, Math.max(0, (t - n0.t) / (n1.t - n0.t)));
+        return n0.gainDB + (n1.gainDB - n0.gainDB) * r;
+      };
+      const out = [];
+      if (a < src[0].t - 1e-9) out.push({ t: num(a), g: Math.pow(10, dbAt(a) / 20) });
+      for (const n of src) {
+        if (n.t < a - 1e-9 || n.t > b + 1e-9) continue;
+        out.push({ t: num(n.t), g: Math.pow(10, n.gainDB / 20) });
+      }
+      if (b > src[src.length - 1].t + 1e-9) out.push({ t: num(b), g: Math.pow(10, dbAt(b) / 20) });
+      out.sort((p, q) => p.t - q.t);
+      return out;
+    }
+    if (proposal.kind === 'limiter') {
+      if (!limLog || !limLog.log) return [{ t: num(a), g: 1 }, { t: num(b), g: 1 }];
+      const i0 = limLog.coreStartFrame | 0;
+      const i1 = Math.min(limLog.log.length, i0 + Math.round((b - a) * limLog.sr / SUB) * SUB);
+      return simplifyGainCurve(limLog.log, i0, i1, limLog.sr, a, limLog.scale ?? 1);
+    }
+    return null;
+  }
+
+  /* 全速率限制器增益曲线 → 分段线性节点（一维 ε-管道折线简化）。
+     maxGap 保证慢变化段也有足够分辨率；误差超 tol 即落一个关键点（快攻击自然变密）。
+     scale=前置恒定增益（limiter 提案实际处理 = preGain × 包络）。
+     安全偏置：衰减段节点增益整体再降 bias（朝更安全方向），线性插值即便略高于真实
+     增益曲线，落地后真峰值仍不超过离线验证过的上限；未衰减区强制为 1（框外语义）。 */
+  function simplifyGainCurve(log, i0, i1, sr, tOffset, scale) {
+    scale = scale ?? 1;
+    const TOL = 0.002, BIAS = 0.0015, MAX_GAP = Math.round(0.02 * sr);
+    const keep = [0];
+    let start = 0;
+    const n = i1 - i0;
+    for (let i = 1; i < n; i++) {
+      let force = i - start >= MAX_GAP;
+      if (!force) {
+        const g0 = log[i0 + start], g1 = log[i0 + i];
+        for (let k = start + 1; k < i; k++) {
+          const chord = g0 + (g1 - g0) * ((k - start) / (i - start));
+          if (Math.abs(log[i0 + k] - chord) > TOL) { force = true; break; }
+        }
+      }
+      if (force) { keep.push(i - 1); start = i - 1; }
+    }
+    keep.push(n - 1);
+    return keep.map(k => {
+      let e = log[i0 + k];                 // 限制器包络
+      if (e > 0.9995) e = 1;              // 未衰减区：严格 1，框边/框外绝不引入变化
+      else e = Math.max(0, e - BIAS);     // 衰减段：朝更安全方向偏置
+      return { t: num((tOffset || 0) + k / sr), g: num(e * scale) };
+    });
+  }
+
   /* ---------- 提案评估：渲染 → 非破坏处理 → 度量（整区间一次流式） ----------
      处理器作用在临时渲染缓冲上，绝不触碰素材。返回修正后指标、波形与冲突差距。 */
   async function evaluateProposal(snap, a, b, proposal, preset, deps, opts) {
@@ -595,6 +674,7 @@
     const lim = proposal.kind === 'limiter' ? makeLimiter({
       ceilingDBTP: proposal.ceilingDBTP, attackSec: proposal.attackSec,
       releaseSec: proposal.releaseSec, lookaheadSec: proposal.lookaheadSec, channels,
+      recordGain: true,
     }) : null;
     const delay = lim ? lim.delaySamples : 0;
 
@@ -679,6 +759,8 @@
       status: 'done', proposal, metrics, evaluation, conflicts,
       feasible: conflicts.length === 0,
       limiterStats: lim ? lim.stats() : null,
+      gainNodes: proposalGainNodes(proposal, a, b,
+        lim ? { log: lim.gainLog, coreStartFrame: coreStart, sr: ANALYSIS_SR, scale: pre } : null),
       wave,
     };
   }
@@ -777,6 +859,7 @@
     analyzeSegment,
     makeEnvelope, makeLimiter,
     planUniform, planEnvelope, planLimiter,
+    proposalGainNodes, simplifyGainCurve,
     evaluateProposal, renderProcessed,
     crc32, encodeSegmentRecord, decodeSegmentRecord,
     meanSquaresToLUFS,

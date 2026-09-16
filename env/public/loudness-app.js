@@ -59,7 +59,8 @@
 
     function persist() { if (deps.persist) deps.persist(); }
 
-    /* 提交（去重）：同 key 且处于活动/完成状态的任务只保留一份 */
+    /* 提交（去重）：同 key 且处于活动/完成状态的任务只保留一份；
+       stale（已过期/已被撤销）任务不参与去重——撤销修正后重新检查同一内容应重新运行。 */
     function submit(req) {
       const key = snapshotKey(req.snap, req.a, req.b, req.preset.id) + '|' + (req.segmentSec || 5);
       const dup = tasks.find(t => t.key === key &&

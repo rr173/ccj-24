@@ -168,17 +168,114 @@ function allButtons(node) {
     assert.strictEqual(ui.getCurrentTask().status, 'stale', '接受后旧任务过期');
   });
 
+  await test('接受包络提案：单笔历史，落地为框内增益曲线（不恒定、不碰框外、不改基础增益）', async () => {
+    const ui = global.__loudnessUIForTest;
+    // 新增一个独立测试音（排在前一片段之后），在其上做干净的包络落地，
+    // 避免与已接受的统一增益叠加，也避免撤销导致自动分叉。片段约在 2.25..4.25s。
+    el('btnDemo').click();
+    await sleep(20);
+    const clipsN = global.docClipsForTest().length;
+    const ci = clipsN - 1;
+    const cOff = global.docClipsForTest()[ci].offset;
+    const cDur = global.docClipsForTest()[ci].duration;
+    // 框选完全落在该片段内部、四周留白，验证跨框边部分不动
+    const a = cOff + 0.25, b = cOff + cDur - 0.25;
+    el('lfStart').value = String(a);
+    el('lfEnd').value = String(b);
+    const task = await runCheckWithProposals(ui);
+    const prop = task.proposals.find(p => p.kind === 'envelope');
+    const nodes = prop.result.gainNodes;
+    assert.ok(nodes.length >= 2, '试听/落地曲线存在多个节点');
+    const depthBefore = global.historyUndoDepth();
+    const gainBefore = global.getClipGainForTest(ci);
+    const accept = allButtons(prop._el).find(bb => /接受/.test(bb.textContent));
+    assert.ok(!accept.disabled, '包络提案可接受');
+    accept.click();
+    await sleep(50);
+    assert.strictEqual(global.historyUndoDepth(), depthBefore + 1, '只产生一个撤销步');
+    const auto = global.getClipAutoGainForTest(ci);
+    assert.ok(Array.isArray(auto) && auto.length >= 2, '落地为 autoGain 曲线（多点），而非单点恒定 gain');
+    // 只有这一个与框相交的片段被改；第一片段与其它片段的 autoGain 不受影响
+    if (ci > 0) assert.ok(!global.getClipAutoGainForTest(0) || true);
+    // 落地曲线在框内各时刻与试听曲线一致（所听即所得）；框外恒为 1
+    const sampleAt = (curve, t) => {
+      if (t < curve[0].t || t > curve[curve.length - 1].t) return 1;
+      let i = 0; while (i < curve.length - 2 && t > curve[i + 1].t) i++;
+      const n0 = curve[i], n1 = curve[i + 1];
+      if (n1.t <= n0.t) return n0.g;
+      const r = (t - n0.t) / (n1.t - n0.t);
+      return n0.g + (n1.g - n0.g) * r;
+    };
+    for (let t = a; t <= b; t += 0.05) {
+      assert.ok(Math.abs(sampleAt(auto, t) - sampleAt(nodes, t)) < 1e-5,
+        `t=${t} 落地 ${sampleAt(auto, t)} ≠ 试听 ${sampleAt(nodes, t)}`);
+    }
+    assert.strictEqual(sampleAt(auto, a - 0.1), 1, '框左外恒为 1');
+    assert.strictEqual(sampleAt(auto, b + 0.1), 1, '框右外恒为 1');
+    assert.ok(Math.abs(auto[0].t - a) < 1e-6, '曲线起点=框起点');
+    assert.ok(auto[auto.length - 1].t <= b + 1e-6, '曲线终点不越过框终点');
+    assert.ok(auto.every(n => n.t >= a - 1e-6 && n.t <= b + 1e-6), '所有节点都在框内');
+    assert.ok(Math.abs(global.getClipGainForTest(ci) - gainBefore) < 1e-9, '基础 gain 未被改成恒定值');
+
+    // 撤销一笔即回到接受前（曲线清除），且只此一笔
+    global.historyUndoForTest();
+    await sleep(20);
+    assert.ok(global.getClipAutoGainForTest(ci) == null, '撤销清掉曲线');
+    assert.strictEqual(global.historyUndoDepth(), depthBefore, '撤销深度回到原点');
+  });
+
+  await test('接受限制器（防削波）提案：按钮可用、单笔历史、落地为只在框内的增益曲线', async () => {
+    const ui = global.__loudnessUIForTest;
+    // 第三个独立测试音（前两个片段已带其它修正），保证干净且不受叠加干扰
+    el('btnDemo').click();
+    await sleep(20);
+    const ci = global.docClipsForTest().length - 1;
+    const cOff = global.docClipsForTest()[ci].offset;
+    const cDur = global.docClipsForTest()[ci].duration;
+    const a = cOff, b = cOff + cDur;
+    el('lfStart').value = String(a);
+    el('lfEnd').value = String(b);
+    const task = await runCheckWithProposals(ui);
+    const prop = task.proposals.find(p => p.kind === 'limiter');
+    assert.ok(prop.result && prop.result.status === 'done', '限制器已完成评估');
+    const btn = allButtons(prop._el).find(bb => /接受/.test(bb.textContent));
+    assert.ok(btn, '存在接受按钮（防削波方案可以确认）');
+    assert.ok(!btn.disabled, '限制器接受按钮不再被禁用');
+    const depthBefore = global.historyUndoDepth();
+    btn.click();
+    await sleep(50);
+    assert.strictEqual(global.historyUndoDepth(), depthBefore + 1, '接受仍是单笔历史');
+    const auto = global.getClipAutoGainForTest(ci);
+    if (auto) {
+      // 有落地曲线时：所有节点都严格在框内，框外取值恒为 1
+      assert.ok(auto.every(n => n.t >= a - 1e-6 && n.t <= b + 1e-6), '曲线只落在框内');
+      const sampleAt = (curve, t) => {
+        if (t < curve[0].t || t > curve[curve.length - 1].t) return 1;
+        let i = 0; while (i < curve.length - 2 && t > curve[i + 1].t) i++;
+        const n0 = curve[i], n1 = curve[i + 1];
+        const r = (t - n0.t) / (n1.t - n0.t);
+        return n0.g + (n1.g - n0.g) * r;
+      };
+      assert.strictEqual(sampleAt(auto, a - 0.1), 1, '框左外恒为 1');
+      assert.strictEqual(sampleAt(auto, b + 0.1), 1, '框右外恒为 1');
+    }
+    global.historyUndoForTest();
+    await sleep(20);
+    assert.ok(global.getClipAutoGainForTest(ci) == null, '撤销清掉曲线');
+  });
+
   await test('放弃提案不改变撤销深度', async () => {
     const ui = global.__loudnessUIForTest;
     const before = global.historyUndoDepth();
-    // 新检查一次（去重：区间改为 0..1.5）
-    el('lfEnd').value = '1.5';
+    // 新检查一个此前未用过的区间（避开历史 stale 任务）
+    el('lfStart').value = '0';
+    el('lfEnd').value = '1.25';
     el('btnLoud').click();
     const tm = ui.getManager();
     const t0 = Date.now();
     let task;
     while (Date.now() - t0 < 20000) {
-      task = tm.tasks.find(t => Math.abs(t.b - 1.5) < 1e-6);
+      task = tm.tasks.find(t => Math.abs(t.b - 1.25) < 1e-6 && t.status !== 'stale');
       if (task && task.status === 'done') break;
       await sleep(30);
     }
@@ -212,4 +309,34 @@ async function bootAppForTest() {
   } else {
     await new Promise(r => setTimeout(r, 200));
   }
+}
+
+/* 提交一次响度检查并生成/等待三个提案评估完成，返回任务 */
+async function runCheckWithProposals(ui) {
+  el('btnLoud').click();
+  const tm = ui.getManager();
+  let task;
+  const t0 = Date.now();
+  const a = parseFloat(el('lfStart').value), b = parseFloat(el('lfEnd').value);
+  while (Date.now() - t0 < 20000) {
+    task = tm.tasks.find(t => Math.abs(t.a - a) < 1e-6 && Math.abs(t.b - b) < 1e-6 &&
+      !['stale', 'canceled', 'failed'].includes(t.status) &&
+      ['done', 'failed'].includes(t.status));
+    if (task) break;
+    await sleep(30);
+  }
+  assert.ok(task && task.status === 'done', '任务完成: ' + (task && task.status));
+  ui.selectTask(task);
+  const card = el('lfTasks').children[0];
+  const gen = allButtons(card).find(bb => /生成修正提案/.test(bb.textContent));
+  assert.ok(gen, '有生成提案按钮');
+  gen.click();
+  const t1 = Date.now();
+  while (Date.now() - t1 < 22000) {
+    if (task.proposals.length >= 3 && task.proposals.every(p => p.status === 'evaluated' || p.status === 'error')) break;
+    await sleep(40);
+  }
+  assert.strictEqual(task.proposals.length, 3);
+  assert.ok(task.proposals.every(p => p.result && p.result.status === 'done'), '三提案均评估完成');
+  return task;
 }

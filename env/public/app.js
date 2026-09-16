@@ -4,7 +4,7 @@
 
 let ctx = null;          // AudioContext（首次交互时创建）
 let master = null;       // 主增益 → 预览增益 → 压限 → 输出。所有片段在此汇合，重叠处自然按增益相加
-let previewGain = null;  // 响度提案试听节点（默认直通，非破坏）
+let previewGain = null;  // 历史命名：响度提案试听不再经过此节点（改为逐片段增益曲线），保留总线位置
 let comp = null;
 
 const LANE_H = 60;       // 每条泳道高度(px)，与 .clip 高度一致
@@ -605,25 +605,55 @@ function scheduleClipInSeg(clip, tlFrom, tlTo, seg) {
   state.scheduled.push({ clipId: clip.id, src, gain: g, whenCtx: when, endCtx: when + (e - s) });
 }
 
-function applyEnvelope(p, clip, when, tlS, tlE) {
+/* 片段总增益（节目时间 t）：基础增益 × 淡化 × 已落地 autoGain × 试听提案曲线。
+   autoGain 与试听曲线都是「框内分段线性、框外恒 1」，试听与落地走同一求值，所听即所得。 */
+function clipGainAt(clip, t) {
   const cs = clip.offset, ce = cs + clip.duration;
   let fi = Math.min(clip.fadeIn, clip.duration);
   let fo = Math.min(clip.fadeOut, clip.duration);
   if (fi + fo > clip.duration) { const k = clip.duration / (fi + fo); fi *= k; fo *= k; }
-  const gainAt = t => {
-    let v = clip.gain;
-    if (fi > 1e-6 && t < cs + fi) v *= Math.max(0, (t - cs) / fi);
-    if (fo > 1e-6 && t > ce - fo) v *= Math.max(0, (ce - t) / fo);
-    return v;
+  let v = clip.gain;
+  if (fi > 1e-6 && t < cs + fi) v *= Math.max(0, (t - cs) / fi);
+  if (fo > 1e-6 && t > ce - fo) v *= Math.max(0, (ce - t) / fo);
+  if (Array.isArray(clip.autoGain) && clip.autoGain.length) v *= gainCurveAt(clip.autoGain, t);
+  if (previewExtra && previewExtra.gainNodes) v *= gainCurveAt(previewExtra.gainNodes, t);
+  return v;
+}
+/* 分段线性增益曲线取值：曲线范围外严格为 1（框外绝不变化） */
+function gainCurveAt(nodes, t) {
+  if (!nodes.length) return 1;
+  const first = nodes[0], last = nodes[nodes.length - 1];
+  if (t < first.t || t > last.t) return 1;
+  if (t === first.t) return first.g;
+  if (t === last.t) return last.g;
+  let i = 0;
+  while (i < nodes.length - 2 && t > nodes[i + 1].t) i++;
+  const n0 = nodes[i], n1 = nodes[i + 1];
+  const r = (t - n0.t) / (n1.t - n0.t);
+  return n0.g + (n1.g - n0.g) * r;
+}
+
+function applyEnvelope(p, clip, when, tlS, tlE) {
+  // 关键点：区间两端 + 淡化拐点 + 试听/落地增益曲线在本调度窗内的全部节点
+  let fi = Math.min(clip.fadeIn, clip.duration);
+  let fo = Math.min(clip.fadeOut, clip.duration);
+  if (fi + fo > clip.duration) { const k = clip.duration / (fi + fo); fi *= k; fo *= k; }
+  const times = new Set([tlS, tlE]);
+  const fiEnd = clip.offset + fi;
+  const foStart = clip.offset + clip.duration - fo;
+  if (fi > 1e-6 && fiEnd > tlS && fiEnd < tlE) times.add(fiEnd);
+  if (fo > 1e-6 && foStart > tlS && foStart < tlE) times.add(foStart);
+  const collect = nodes => {
+    if (!nodes) return;
+    for (const n of nodes) if (n.t > tlS && n.t < tlE) times.add(n.t);
   };
-  const pts = [[tlS, gainAt(tlS)]];
-  if (fi > 1e-6 && cs + fi > tlS && cs + fi < tlE) pts.push([cs + fi, gainAt(cs + fi)]);
-  if (fo > 1e-6 && ce - fo > tlS && ce - fo < tlE) pts.push([ce - fo, gainAt(ce - fo)]);
-  pts.push([tlE, gainAt(tlE)]);
+  if (Array.isArray(clip.autoGain)) collect(clip.autoGain);
+  if (previewExtra && previewExtra.gainNodes) collect(previewExtra.gainNodes);
+  const pts = [...times].sort((a, b) => a - b).map(t => [t, clipGainAt(clip, t)]);
   const t2c = tl => when + (tl - tlS);
-  p.setValueAtTime(pts[0][1], t2c(pts[0][0]));
+  p.setValueAtTime(Math.max(pts[0][1], 1e-6), t2c(pts[0][0]));
   for (let i = 1; i < pts.length; i++) {
-    p.linearRampToValueAtTime(Math.max(pts[i][1], 1e-5), t2c(pts[i][0]));
+    p.linearRampToValueAtTime(Math.max(pts[i][1], 1e-6), t2c(pts[i][0]));
   }
 }
 
@@ -664,68 +694,51 @@ function stopSources() {
   state.scheduled = [];
 }
 
-/* ================= 响度提案试听处理器（实时、非破坏） =================
-   插在 master 与 comp 之间，默认直通；接受/放弃时移除，片段参数始终不变。
-   - uniform：恒定增益 GainNode
-   - envelope：关键点线性 ramp（用核心同一份节点时间/值）
-   - limiter：前置增益 + DynamicsCompressor（试听近似；最终以离线度量为准） */
+/* ================= 响度提案试听（实时、非破坏、只作用于框内） =================
+   不再在 master 总线上插全局处理器（那会让框外声量也跟着变），而是把提案等价成
+   一条「节目时间 → 线性增益」曲线（与离线评估、落地共用同一份节点），调度每个片段时
+   叠加到它自己的 GainNode：曲线范围（=框选区间）外恒为 1，框外片段/框外部分原样播放。
+   切换试听时立即撤换尚未发声的调度，听到的就是落地后的结果。 */
 let previewExtra = null;
-function attachPreviewProcessor(kind, params, rangeA, rangeB) {
+function attachPreviewProcessor(kind, params, rangeA, rangeB, gainNodes) {
   detachPreviewProcessor();
   ensureCtx();
-  const node = ctx.createGain(); node.gain.value = 1;
-  // 把原 master→previewGain 的连接改为经过 node
-  try { master.disconnect(previewGain); } catch (_) {}
-  master.connect(node).connect(previewGain);
-  previewExtra = { kind, node, rangeA, rangeB };
-  const now = ctx.currentTime;
-  if (kind === 'uniform') {
-    node.gain.setValueAtTime(Math.pow(10, params.gainDB / 20), now);
-  } else if (kind === 'envelope') {
-    const g0 = Math.pow(10, params.nodes[0].gainDB / 20);
-    node.gain.setValueAtTime(g0, now);
-    previewExtra.timer = setInterval(() => scheduleEnvelope(node, params), 200);
-    scheduleEnvelope(node, params);
-  } else if (kind === 'limiter') {
-    // 前置增益 + 压缩器（近似离线 4× 过采样限制器的听感）
-    const pre = ctx.createGain();
-    pre.gain.value = Math.pow(10, params.preGainDB / 20);
-    const lim = ctx.createDynamicsCompressor();
-    lim.threshold.value = params.ceilingDBTP - 1;
-    lim.knee.value = 0; lim.ratio.value = 20;
-    lim.attack.value = Math.max(0, params.attackSec || 0.0005);
-    lim.release.value = Math.max(0.01, params.releaseSec || 0.15);
-    // 输出回到 ceiling（compressor 不保证硬上限，补偿增益）
-    const makeup = ctx.createGain(); makeup.gain.value = Math.pow(10, (params.ceilingDBTP - 0) / 20);
-    try { master.disconnect(node); } catch (_) {}
-    master.connect(pre).connect(lim).connect(makeup).connect(previewGain);
-    previewExtra.node = node; previewExtra.chain = [pre, lim, makeup];
-  }
-}
-function scheduleEnvelope(node, params) {
-  if (!previewExtra) return;
-  const t = posNow();
-  const now = ctx.currentTime;
-  const ns = params.nodes;
-  // 找当前区间，ramp 到后续关键点（10s 窗口足够，定时器持续推进）
-  let i = 0; while (i < ns.length - 1 && t > ns[i + 1].t) i++;
-  const cur = ns[i], nxt = ns[Math.min(i + 1, ns.length - 1)];
-  const gNow = Math.pow(10, cur.gainDB / 20);
-  node.gain.cancelScheduledValues(now);
-  node.gain.setValueAtTime(gNow, now);
-  for (let k = i + 1; k < Math.min(ns.length, i + 40); k++) {
-    node.gain.linearRampToValueAtTime(Math.pow(10, ns[k].gainDB / 20), now + Math.max(0, ns[k].t - t));
-  }
+  previewExtra = { kind, params, rangeA, rangeB, gainNodes: gainNodes || null };
+  if (state.playing) rescheduleAllClipsNow();
 }
 function detachPreviewProcessor() {
   if (!previewExtra) return;
-  if (previewExtra.timer) clearInterval(previewExtra.timer);
-  try {
-    master.disconnect();
-    // 重建到 previewGain 的直连
-    master.connect(previewGain);
-  } catch (_) {}
+  const was = previewExtra;
   previewExtra = null;
+  if (state.playing) rescheduleAllClipsNow();
+  return was;
+}
+
+/* 试听切换后：撤换所有未发声的调度，用新的每片段增益曲线立即补调度 */
+function rescheduleAllClipsNow() {
+  if (!ctx || !state.playing) return;
+  const now = ctx.currentTime;
+  state.scheduled = state.scheduled.filter(e => {
+    if (e.whenCtx > now - 0.005) { try { e.src.stop(); } catch (_) {} return false; }
+    return true;
+  });
+  const last = state.segments[state.segments.length - 1];
+  for (const seg of state.segments) {
+    const segEndCtx = seg.ctxStart + (seg.tlEnd - seg.tlStart);
+    if (segEndCtx < now) continue;
+    const segNowTl = seg.tlStart + Math.max(0, now - seg.ctxStart);
+    for (const clip of state.clips) {
+      if (!clip.buffer) continue;
+      const cs = clip.offset, ce = cs + clip.duration;
+      const s = Math.max(cs, seg.tlStart, segNowTl + 0.03);
+      const e = Math.min(ce, seg.tlEnd);
+      if (e - s < 0.005) continue;
+      const when = seg.ctxStart + (s - seg.tlStart);
+      if (when < now + 0.02) continue;
+      if (seg === last && s >= state.scheduledUntil - 1e-9) continue;
+      scheduleClipInSeg(clip, s, e, seg);
+    }
+  }
 }
 
 function posNow() {
@@ -1358,6 +1371,7 @@ function takeSnapshot(a, b) {
       name: c.name, buffer: c.buffer,
       offset: c.offset, gain: c.gain,
       fadeIn: c.fadeIn, fadeOut: c.fadeOut, duration: c.duration,
+      autoGain: c.autoGain || null,
     });
   }
   clips.sort((x, y) => x.offset - y.offset || bufferUid(x.buffer) - bufferUid(y.buffer));
@@ -1374,6 +1388,7 @@ function takeLoudSnapshot(a, b) {
     clips.push({
       name: c.name, buffer: c.buffer, mediaHash: c.mediaHash,
       offset: c.offset, gain: c.gain, fadeIn: c.fadeIn, fadeOut: c.fadeOut, duration: c.duration,
+      autoGain: c.autoGain || null,
     });
   }
   clips.sort((x, y) => x.offset - y.offset || (x.mediaHash || '').localeCompare(y.mediaHash || ''));
@@ -1389,34 +1404,75 @@ function browserRenderMix(snap, t0, t1, channels, onChunk, sampleRate) {
 }
 
 /* 把非破坏提案参数落成「一次提交」的批量补丁。
-   - uniform：区间内每个片段按其覆盖时长加权应用同一 dB 增益（增益叠加在 gain 上）。
-   - envelope：片段中心时间落在包络哪个位置，就应用该处 dB（同样叠加在 gain 上）。
-   - limiter：实时/离线限制不能用纯片段增益等价表达；这里不直接改片段，
-     而是提示需要「烤轨为新片段」（保留非破坏语义），返回空补丁由 UI 引导。 */
-function buildProposalPatch(taskRange, params, kind, docClips) {
-  if (kind === 'limiter') return null; // 需烤轨；UI 另行处理（当前版本给出提示）
+   提案在离线评估时已等价为一条节目时间上的线性增益曲线（propResult.gainNodes），
+   范围严格等于框选 [a,b)、框外为 1。落地 = 给与框相交的每个片段叠加同一条曲线到其
+   autoGain：曲线乘法可分配，重叠片段各自乘 g(t) 与总线乘 g(t)·Σxᵢ 逐样本一致；
+   片段在框外的部分（含跨越框边的片段）曲线取值恒为 1，因此只作用于框内。
+   已存在 autoGain（上一次修正）时按曲线相乘合并，仍是一次更新/片段、一个历史节点。 */
+function buildProposalPatch(taskRange, params, kind, docClipsArg, propResult) {
   const { a, b } = taskRange;
-  const gainAt = t => {
-    if (kind === 'uniform') return params.gainDB;
-    const ns = params.nodes;
-    let i = 0; while (i < ns.length - 1 && t > ns[i + 1].t) i++;
-    const n0 = ns[i], n1 = ns[Math.min(i + 1, ns.length - 1)];
-    if (n1.t <= n0.t) return n0.gainDB;
-    const r = Math.min(1, Math.max(0, (t - n0.t) / (n1.t - n0.t)));
-    return n0.gainDB + (n1.gainDB - n0.gainDB) * r;
-  };
+  const nodes = propResult && Array.isArray(propResult.gainNodes) ? propResult.gainNodes : null;
+  if (!nodes || nodes.length < 2) return null;
+  const clips = docClipsArg || doc().clips;
   const patch = [];
-  for (const c of docClips || doc().clips) {
-    if (c.offset >= b || c.offset + c.duration <= a) continue;
-    // 以片段与区间重叠部分的中点取增益
-    const oa = Math.max(c.offset, a), ob = Math.min(c.offset + c.duration, b);
-    const mid = (oa + ob) / 2;
-    const db = gainAt(mid);
-    if (Math.abs(db) < 0.01) continue;
-    const newGain = Math.min(2, Math.max(0, c.gain * Math.pow(10, db / 20)));
-    patch.push({ op: 'update', id: c.id, set: { gain: newGain }, old: { gain: c.gain } });
+  for (const c of clips) {
+    if (c.offset >= b || c.offset + c.duration <= a) continue; // 与框不相交：完全不动
+    const merged = composeAutoGain(Array.isArray(c.autoGain) ? c.autoGain : null, nodes);
+    if (!merged) continue; // 合并后恒等于 1：无实际变化
+    if (autoSame(c.autoGain, merged)) continue;
+    patch.push({
+      op: 'update', id: c.id,
+      set: { autoGain: merged },
+      old: { autoGain: c.autoGain || null },
+    });
   }
   return patch;
+}
+
+/* 两条分段线性增益曲线相乘合并，按时间轴（秒，绝对坐标）重采样关键点。
+   base 为片段已有 autoGain（可空）；add 为本次提案曲线（框外=1，由调用方裁剪）。
+   只在片段实际覆盖的时间内取点，返回节点数组；结果恒为 1 时返回 null。 */
+function composeAutoGain(base, add) {
+  const times = new Set();
+  const take = ns => { if (ns) for (const n of ns) times.add(+n.t.toFixed(6)); };
+  take(base); take(add);
+  const ts = [...times].sort((x, y) => x - y);
+  const out = [];
+  let allOne = true;
+  for (const t of ts) {
+    const g = (base ? curveValueOrOne(base, t) : 1) * curveValueOrOne(add, t);
+    const gv = +g.toFixed(6);
+    if (Math.abs(gv - 1) > 1e-5) allOne = false;
+    out.push({ t, g: gv });
+  }
+  if (!out.length) return null;
+  if (allOne) return null;
+  // 去掉相邻共线点，压缩曲线（保留端点）
+  const slim = [out[0]];
+  for (let i = 1; i < out.length - 1; i++) {
+    const p0 = slim[slim.length - 1], p1 = out[i], p2 = out[i + 1];
+    const chord = p0.g + (p2.g - p0.g) * ((p1.t - p0.t) / (p2.t - p0.t || 1e-12));
+    if (Math.abs(chord - p1.g) > 1e-5) slim.push(p1);
+  }
+  slim.push(out[out.length - 1]);
+  return slim;
+}
+function curveValueOrOne(nodes, t) {
+  if (!nodes.length) return 1;
+  const first = nodes[0], last = nodes[nodes.length - 1];
+  if (t < first.t || t > last.t) return 1;
+  if (t <= first.t) return first.g;
+  if (t >= last.t) return last.g;
+  let i = 0;
+  while (i < nodes.length - 2 && t > nodes[i + 1].t) i++;
+  const n0 = nodes[i], n1 = nodes[i + 1];
+  const r = (t - n0.t) / (n1.t - n0.t);
+  return n0.g + (n1.g - n0.g) * r;
+}
+function autoSame(a, b) {
+  if (!a && !b) return true;
+  if (!a || !b || a.length !== b.length) return false;
+  return a.every((n, i) => Math.abs(n.t - b[i].t) < 1e-6 && Math.abs(n.g - b[i].g) < 1e-6);
 }
 function doc() { return store ? store.eng.doc : window.doc(); }
 function specText(spec) {
@@ -1618,10 +1674,11 @@ function initLoudness() {
     commitBatch: (patch, label) => {
       if (patch && patch.length) commit(patch, { label });
     },
-    attachPreviewProcessor: attachPreviewProcessor,
+    attachPreviewProcessor: (kind, params, rangeA, rangeB, gainNodes) =>
+      attachPreviewProcessor(kind, params, rangeA, rangeB, gainNodes),
     detachPreviewProcessor: detachPreviewProcessor,
-    buildProposalPatch: (task, params, kind) => {
-      const r = buildProposalPatch({ a: task.a, b: task.b }, params, kind);
+    buildProposalPatch: (task, params, kind, result) => {
+      const r = buildProposalPatch({ a: task.a, b: task.b }, params, kind, null, result);
       return r;
     },
   });
@@ -1779,5 +1836,9 @@ if (IN_NODE_TEST) {
   globalThis.bootAppForTest = bootAppForTest;
   globalThis.resetAppForTest = resetAppForTest;
   globalThis.historyUndoDepth = () => store.eng ? historyUndoDepth() : 0;
+  globalThis.historyUndoForTest = () => { undo(store.eng); rebuildClips(); };
+  globalThis.getClipGainForTest = i => docClips()[i].gain;
+  globalThis.getClipAutoGainForTest = i => docClips()[i].autoGain;
+  globalThis.docClipsForTest = () => docClips();
   globalThis.__setLoudnessUIForTest = ui => { globalThis.__loudnessUIForTest = ui; };
 }

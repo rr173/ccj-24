@@ -29,7 +29,7 @@
 
   function emptyDoc() {
     return {
-      clips: [],          // {id, name, mediaHash, duration, offset, gain, fadeIn, fadeOut}
+      clips: [],          // {id, name, mediaHash, duration, offset, gain, fadeIn, fadeOut, autoGain?}
       media: {},          // hash -> {hash, name, size, type, duration, channels, sampleRate, missing, corrupt, relinkedFrom}
       loop: null,         // {a, b}
       loopOn: true,
@@ -286,7 +286,10 @@
       if (p.op === 'remove') return '删除片段';
       if (p.op === 'update') {
         const k = Object.keys(p.set)[0];
-        return ({ offset: '移动片段', gain: '调节增益', fadeIn: '调淡入', fadeOut: '调淡出' })[k] || '修改片段';
+        return ({
+          offset: '移动片段', gain: '调节增益', fadeIn: '调淡入', fadeOut: '调淡出',
+          autoGain: '响度修正（增益曲线）',
+        })[k] || '修改片段';
       }
       if (p.op === 'loop') return p.new ? '设置循环区间' : '清除循环区间';
       if (p.op === 'loopOn') return '循环开关';
@@ -445,7 +448,7 @@
     const out = { added: [], removed: [], changed: [], media: [] };
     const baseById = new Map(baseDoc.clips.map(c => [c.id, c]));
     const curById = new Map(curDoc.clips.map(c => [c.id, c]));
-    const PARAMS = ['offset', 'gain', 'fadeIn', 'fadeOut', 'duration', 'name', 'mediaHash'];
+    const PARAMS = ['offset', 'gain', 'fadeIn', 'fadeOut', 'duration', 'name', 'mediaHash', 'autoGain'];
     for (const c of curDoc.clips) {
       const b = baseById.get(c.id);
       if (!b) { out.added.push(clone(c)); continue; }
@@ -520,7 +523,7 @@
       if (!fromById.has(c.id)) patch.push({ op: 'add', clip: c });
       else {
         const a = fromById.get(c.id), set = {};
-        for (const k of ['name', 'mediaHash', 'duration', 'offset', 'gain', 'fadeIn', 'fadeOut']) {
+        for (const k of ['name', 'mediaHash', 'duration', 'offset', 'gain', 'fadeIn', 'fadeOut', 'autoGain']) {
           if (JSON.stringify(a[k]) !== JSON.stringify(c[k])) set[k] = c[k];
         }
         if (Object.keys(set).length) {
